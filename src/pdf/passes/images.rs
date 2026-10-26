@@ -195,14 +195,14 @@ fn orphan_scale(width: u32, height: u32, target_dpi: u32) -> Option<f64> {
 
 fn downsample_if_needed(
     image: DynamicImage,
-    width: u32,
-    height: u32,
+    grid: PixelGrid,
     target_dpi: Option<u32>,
     page: Option<&PageDimensions>,
 ) -> DynamicImage {
     let Some(dpi) = target_dpi else {
         return image;
     };
+    let (width, height) = (grid.width, grid.height);
     let scale = match page {
         Some(page) => page_aware_scale(width, height, dpi, page),
         None => orphan_scale(width, height, dpi),
@@ -250,32 +250,63 @@ fn cmyk_to_rgb(cyan: u8, magenta: u8, yellow: u8, black: u8) -> [u8; 3] {
     [channel(cyan), channel(magenta), channel(yellow)]
 }
 
-fn decode_raw_pixels(
-    data: &[u8],
+#[derive(Debug, Clone, Copy)]
+struct PixelGrid {
     width: u32,
     height: u32,
+}
+
+impl PixelGrid {
+    fn pixel_count(self) -> usize {
+        self.width as usize * self.height as usize
+    }
+}
+
+fn unsupported_layout(color_space: &str, bits: u8) -> AppError {
+    AppError::ImageDecode(format!(
+        "unsupported color space '{color_space}' with {bits} bits per component"
+    ))
+}
+
+fn component_count_for(
+    data: &[u8],
+    grid: PixelGrid,
     color_space: &str,
     bits: u8,
-) -> AppResult<DynamicImage> {
-    let unsupported = || {
-        AppError::ImageDecode(format!(
-            "unsupported color space '{color_space}' with {bits} bits per component"
-        ))
-    };
+) -> AppResult<usize> {
     if bits != SUPPORTED_BITS_PER_COMPONENT {
-        return Err(unsupported());
+        return Err(unsupported_layout(color_space, bits));
     }
-    let pixels = width as usize * height as usize;
-    let components =
-        expected_component_count(color_space, data.len(), pixels).ok_or_else(unsupported)?;
+    let pixels = grid.pixel_count();
+    let components = expected_component_count(color_space, data.len(), pixels)
+        .ok_or_else(|| unsupported_layout(color_space, bits))?;
     if pixels == 0 || data.len() != pixels * components {
         return Err(AppError::ImageDecode(format!(
-            "expected {} bytes for {width}x{height} image, found {}",
+            "expected {} bytes for {}x{} image, found {}",
             pixels * components,
+            grid.width,
+            grid.height,
             data.len()
         )));
     }
+    Ok(components)
+}
+
+fn cmyk_buffer_to_rgb(data: &[u8]) -> Vec<u8> {
+    data.chunks_exact(4)
+        .flat_map(|ink| cmyk_to_rgb(ink[0], ink[1], ink[2], ink[3]))
+        .collect()
+}
+
+fn decode_raw_pixels(
+    data: &[u8],
+    grid: PixelGrid,
+    color_space: &str,
+    bits: u8,
+) -> AppResult<DynamicImage> {
+    let components = component_count_for(data, grid, color_space, bits)?;
     let mismatch = || AppError::ImageDecode("pixel buffer does not match dimensions".to_string());
+    let (width, height) = (grid.width, grid.height);
     match components {
         1 => image::GrayImage::from_raw(width, height, data.to_vec())
             .map(DynamicImage::ImageLuma8)
@@ -283,16 +314,10 @@ fn decode_raw_pixels(
         3 => image::RgbImage::from_raw(width, height, data.to_vec())
             .map(DynamicImage::ImageRgb8)
             .ok_or_else(mismatch),
-        4 => {
-            let rgb: Vec<u8> = data
-                .chunks_exact(4)
-                .flat_map(|ink| cmyk_to_rgb(ink[0], ink[1], ink[2], ink[3]))
-                .collect();
-            image::RgbImage::from_raw(width, height, rgb)
-                .map(DynamicImage::ImageRgb8)
-                .ok_or_else(mismatch)
-        }
-        _ => Err(unsupported()),
+        4 => image::RgbImage::from_raw(width, height, cmyk_buffer_to_rgb(data))
+            .map(DynamicImage::ImageRgb8)
+            .ok_or_else(mismatch),
+        _ => Err(unsupported_layout(color_space, bits)),
     }
 }
 
@@ -321,8 +346,7 @@ fn encode_jpeg_candidate(
 
 struct SourceImage {
     image: DynamicImage,
-    width: u32,
-    height: u32,
+    grid: PixelGrid,
 }
 
 fn reencode_dct(
@@ -340,18 +364,11 @@ fn reencode_dct(
         image_dimensions(&stream.dict).unwrap_or((decoded.width(), decoded.height()));
     let source = SourceImage {
         image: decoded,
-        width,
-        height,
+        grid: PixelGrid { width, height },
     };
     let quality =
         adjust_quality_for_complexity(options.jpeg_quality, estimate_complexity(&source.image));
-    let resized = downsample_if_needed(
-        source.image,
-        source.width,
-        source.height,
-        options.target_dpi,
-        page,
-    );
+    let resized = downsample_if_needed(source.image, source.grid, options.target_dpi, page);
     let bytes = encode_jpeg_candidate(&resized, quality, options.color_mode)?;
     Ok(Some(ReencodedImage {
         bytes,
@@ -402,28 +419,33 @@ fn predictor_candidate(
     ))
 }
 
+fn decode_raw_stream(stream: &Stream, options: &PdfOptions) -> AppResult<SourceImage> {
+    let (width, height) = image_dimensions(&stream.dict)
+        .ok_or_else(|| AppError::ImageDecode("missing Width/Height".to_string()))?;
+    check_pixel_limit(width, height, options)?;
+    let raw = decode_plain_stream(stream, options.limits.max_stream_bytes)?;
+    let grid = PixelGrid { width, height };
+    let image = decode_raw_pixels(
+        &raw,
+        grid,
+        &color_space_name(&stream.dict),
+        bits_per_component(&stream.dict),
+    )?;
+    Ok(SourceImage { image, grid })
+}
+
 fn reencode_raw(
     stream: &Stream,
     options: &PdfOptions,
     page: Option<&PageDimensions>,
 ) -> AppResult<Option<ReencodedImage>> {
-    let (width, height) = image_dimensions(&stream.dict)
-        .ok_or_else(|| AppError::ImageDecode("missing Width/Height".to_string()))?;
-    check_pixel_limit(width, height, options)?;
-    let raw = decode_plain_stream(stream, options.limits.max_stream_bytes)?;
-    let color_space = color_space_name(&stream.dict);
-    let decoded = decode_raw_pixels(
-        &raw,
-        width,
-        height,
-        &color_space,
-        bits_per_component(&stream.dict),
-    )?;
+    let source = decode_raw_stream(stream, options)?;
+    let decoded = source.image;
     let lossless = options.image_encoding == ImageEncodingMode::Lossless;
     let target_dpi = if lossless { None } else { options.target_dpi };
     let quality =
         adjust_quality_for_complexity(options.jpeg_quality, estimate_complexity(&decoded));
-    let resized = downsample_if_needed(decoded, width, height, target_dpi, page);
+    let resized = downsample_if_needed(decoded, source.grid, target_dpi, page);
     let describe = |bytes: Vec<u8>, codec: ReencodedCodec| ReencodedImage {
         bytes,
         codec,
@@ -845,21 +867,47 @@ mod tests {
     #[test]
     fn decode_raw_pixels_rgb8_succeeds() {
         let pixels: Vec<u8> = vec![255, 0, 0, 0, 255, 0, 0, 0, 255, 128, 128, 128];
-        let image = decode_raw_pixels(&pixels, 2, 2, "DeviceRGB", 8).unwrap();
+        let image = decode_raw_pixels(
+            &pixels,
+            PixelGrid {
+                width: 2,
+                height: 2,
+            },
+            "DeviceRGB",
+            8,
+        )
+        .unwrap();
         assert_eq!((image.width(), image.height()), (2, 2));
         assert_eq!(image.to_rgb8().get_pixel(1, 0).0, [0, 255, 0]);
     }
 
     #[test]
     fn decode_raw_pixels_gray8_succeeds() {
-        let image = decode_raw_pixels(&[0, 64, 128, 255], 4, 1, "DeviceGray", 8).unwrap();
+        let image = decode_raw_pixels(
+            &[0, 64, 128, 255],
+            PixelGrid {
+                width: 4,
+                height: 1,
+            },
+            "DeviceGray",
+            8,
+        )
+        .unwrap();
         assert_eq!(image.to_luma8().get_pixel(3, 0).0, [255]);
     }
 
     #[test]
     fn decode_raw_pixels_cmyk_converts_to_rgb() {
-        let image =
-            decode_raw_pixels(&[0, 0, 0, 0, 255, 255, 255, 0], 2, 1, "DeviceCMYK", 8).unwrap();
+        let image = decode_raw_pixels(
+            &[0, 0, 0, 0, 255, 255, 255, 0],
+            PixelGrid {
+                width: 2,
+                height: 1,
+            },
+            "DeviceCMYK",
+            8,
+        )
+        .unwrap();
         let rgb = image.to_rgb8();
         assert_eq!(rgb.get_pixel(0, 0).0, [255, 255, 255]);
         assert_eq!(rgb.get_pixel(1, 0).0, [0, 0, 0]);
@@ -867,17 +915,71 @@ mod tests {
 
     #[test]
     fn decode_raw_pixels_infers_icc_based_components_from_length() {
-        let image = decode_raw_pixels(&[1, 2, 3, 4, 5, 6], 2, 1, "ICCBased", 8).unwrap();
+        let image = decode_raw_pixels(
+            &[1, 2, 3, 4, 5, 6],
+            PixelGrid {
+                width: 2,
+                height: 1,
+            },
+            "ICCBased",
+            8,
+        )
+        .unwrap();
         assert_eq!(image.to_rgb8().get_pixel(1, 0).0, [4, 5, 6]);
     }
 
     #[test]
     fn decode_raw_pixels_rejects_length_mismatch_and_unsupported_inputs() {
-        assert!(decode_raw_pixels(&[0u8; 11], 2, 2, "DeviceRGB", 8).is_err());
-        assert!(decode_raw_pixels(&[0u8; 13], 2, 2, "DeviceRGB", 8).is_err());
-        assert!(decode_raw_pixels(&[0u8; 12], 2, 2, "DeviceN", 8).is_err());
-        assert!(decode_raw_pixels(&[0u8; 12], 2, 2, "DeviceRGB", 16).is_err());
-        assert!(decode_raw_pixels(&[], 0, 0, "DeviceRGB", 8).is_err());
+        assert!(decode_raw_pixels(
+            &[0u8; 11],
+            PixelGrid {
+                width: 2,
+                height: 2
+            },
+            "DeviceRGB",
+            8
+        )
+        .is_err());
+        assert!(decode_raw_pixels(
+            &[0u8; 13],
+            PixelGrid {
+                width: 2,
+                height: 2
+            },
+            "DeviceRGB",
+            8
+        )
+        .is_err());
+        assert!(decode_raw_pixels(
+            &[0u8; 12],
+            PixelGrid {
+                width: 2,
+                height: 2
+            },
+            "DeviceN",
+            8
+        )
+        .is_err());
+        assert!(decode_raw_pixels(
+            &[0u8; 12],
+            PixelGrid {
+                width: 2,
+                height: 2
+            },
+            "DeviceRGB",
+            16
+        )
+        .is_err());
+        assert!(decode_raw_pixels(
+            &[],
+            PixelGrid {
+                width: 0,
+                height: 0
+            },
+            "DeviceRGB",
+            8
+        )
+        .is_err());
     }
 
     #[test]
@@ -888,8 +990,10 @@ mod tests {
         };
         let result = downsample_if_needed(
             DynamicImage::new_rgb8(100, 100),
-            100,
-            100,
+            PixelGrid {
+                width: 100,
+                height: 100,
+            },
             Some(150),
             Some(&dims),
         );
@@ -904,8 +1008,10 @@ mod tests {
         };
         let result = downsample_if_needed(
             DynamicImage::new_rgb8(600, 600),
-            600,
-            600,
+            PixelGrid {
+                width: 600,
+                height: 600,
+            },
             Some(150),
             Some(&dims),
         );
@@ -914,8 +1020,15 @@ mod tests {
 
     #[test]
     fn downsample_orphan_skips_tiny_images() {
-        let result =
-            downsample_if_needed(DynamicImage::new_rgb8(100, 100), 100, 100, Some(300), None);
+        let result = downsample_if_needed(
+            DynamicImage::new_rgb8(100, 100),
+            PixelGrid {
+                width: 100,
+                height: 100,
+            },
+            Some(300),
+            None,
+        );
         assert_eq!(result.width(), 100);
     }
 
@@ -923,8 +1036,10 @@ mod tests {
     fn downsample_orphan_reduces_large_images_above_pixel_budget() {
         let result = downsample_if_needed(
             DynamicImage::new_rgb8(2000, 2000),
-            2000,
-            2000,
+            PixelGrid {
+                width: 2000,
+                height: 2000,
+            },
             Some(150),
             None,
         );
@@ -933,8 +1048,15 @@ mod tests {
 
     #[test]
     fn downsample_without_target_dpi_is_identity() {
-        let result =
-            downsample_if_needed(DynamicImage::new_rgb8(2000, 2000), 2000, 2000, None, None);
+        let result = downsample_if_needed(
+            DynamicImage::new_rgb8(2000, 2000),
+            PixelGrid {
+                width: 2000,
+                height: 2000,
+            },
+            None,
+            None,
+        );
         assert_eq!(result.width(), 2000);
     }
 

@@ -318,18 +318,64 @@ fn decode_content_stream(
     }
 }
 
+fn convertible_streams(
+    document: &Document,
+    page_id: ObjectId,
+    shared_counts: &HashMap<ObjectId, usize>,
+    options: &PdfOptions,
+) -> Vec<(ObjectId, Vec<u8>)> {
+    page_content_stream_ids(document, page_id)
+        .into_iter()
+        .filter(|id| shared_counts.get(id).copied().unwrap_or(0) == 1)
+        .filter_map(|id| decode_content_stream(document, id, options).map(|data| (id, data)))
+        .filter(|(_, data)| contains_inline_image(data))
+        .collect()
+}
+
+fn rewritten_stream(
+    document: &Document,
+    stream_id: ObjectId,
+    content: &[u8],
+    options: &PdfOptions,
+) -> Option<Stream> {
+    let Some(Object::Stream(original)) = document.objects.get(&stream_id) else {
+        return None;
+    };
+    let mut rewritten = original.clone();
+    let level = options.level.preset().deflate_level;
+    match store_as_flate(&mut rewritten, content, level) {
+        Ok(()) => Some(rewritten),
+        Err(error) => {
+            warn!(object_id = ?stream_id, error = %error, "Cannot re-encode content stream; inline images kept");
+            None
+        }
+    }
+}
+
+fn register_images(
+    document: &mut Document,
+    resources_id: ObjectId,
+    images: Vec<(String, Stream)>,
+) -> AppResult<usize> {
+    let registered: Vec<(String, ObjectId)> = images
+        .into_iter()
+        .map(|(name, image)| (name, document.add_object(Object::Stream(image))))
+        .collect();
+    let count = registered.len();
+    let xobjects = xobject_dictionary_mut(document, resources_id)?;
+    for (name, image_id) in registered {
+        xobjects.set(name, Object::Reference(image_id));
+    }
+    Ok(count)
+}
+
 fn convert_page(
     document: &mut Document,
     page_id: ObjectId,
     shared_counts: &HashMap<ObjectId, usize>,
     options: &PdfOptions,
 ) -> AppResult<usize> {
-    let candidates: Vec<(ObjectId, Vec<u8>)> = page_content_stream_ids(document, page_id)
-        .into_iter()
-        .filter(|id| shared_counts.get(id).copied().unwrap_or(0) == 1)
-        .filter_map(|id| decode_content_stream(document, id, options).map(|data| (id, data)))
-        .filter(|(_, data)| contains_inline_image(data))
-        .collect();
+    let candidates = convertible_streams(document, page_id, shared_counts, options);
     if candidates.is_empty() {
         return Ok(0);
     }
@@ -340,29 +386,13 @@ fn convert_page(
         let Some(result) = convert_content(&data, next_index) else {
             continue;
         };
-        let Some(Object::Stream(original)) = document.objects.get(&stream_id) else {
+        let Some(rewritten) = rewritten_stream(document, stream_id, &result.content, options)
+        else {
             continue;
         };
-        let mut rewritten = original.clone();
-        if let Err(error) = store_as_flate(
-            &mut rewritten,
-            &result.content,
-            options.level.preset().deflate_level,
-        ) {
-            warn!(object_id = ?stream_id, error = %error, "Cannot re-encode content stream; inline images kept");
-            continue;
-        }
-        let mut new_ids = Vec::new();
-        for (name, image) in result.images {
-            let image_id = document.add_object(Object::Stream(image));
-            new_ids.push((name, image_id));
-        }
-        next_index += new_ids.len() as u32;
-        converted += new_ids.len();
-        let xobjects = xobject_dictionary_mut(document, resources_id)?;
-        for (name, image_id) in new_ids {
-            xobjects.set(name, Object::Reference(image_id));
-        }
+        let added = register_images(document, resources_id, result.images)?;
+        next_index += added as u32;
+        converted += added;
         document
             .objects
             .insert(stream_id, Object::Stream(rewritten));

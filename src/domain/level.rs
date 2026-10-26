@@ -29,69 +29,77 @@ pub struct LevelPreset {
     pub cleanup: CleanupPolicy,
 }
 
+const NO_CLEANUP: CleanupPolicy = CleanupPolicy {
+    remove_markup_annotations: false,
+    remove_forms: false,
+    remove_struct_tree: false,
+    remove_embedded_files: false,
+    remove_output_intents: false,
+};
+
+const HIGH_CLEANUP: CleanupPolicy = CleanupPolicy {
+    remove_markup_annotations: true,
+    remove_forms: false,
+    remove_struct_tree: true,
+    remove_embedded_files: true,
+    remove_output_intents: false,
+};
+
+const EXTREME_CLEANUP: CleanupPolicy = CleanupPolicy {
+    remove_markup_annotations: true,
+    remove_forms: true,
+    remove_struct_tree: true,
+    remove_embedded_files: true,
+    remove_output_intents: true,
+};
+
+const LOW_PRESET: LevelPreset = LevelPreset {
+    jpeg_quality: 90,
+    target_dpi: None,
+    deflate_level: 6,
+    png_effort: 2,
+    strip_metadata: false,
+    grayscale: false,
+    cleanup: NO_CLEANUP,
+};
+
+const MEDIUM_PRESET: LevelPreset = LevelPreset {
+    jpeg_quality: 75,
+    target_dpi: Some(200),
+    deflate_level: 9,
+    png_effort: 4,
+    strip_metadata: false,
+    grayscale: false,
+    cleanup: NO_CLEANUP,
+};
+
+const HIGH_PRESET: LevelPreset = LevelPreset {
+    jpeg_quality: 60,
+    target_dpi: Some(150),
+    deflate_level: 9,
+    png_effort: 5,
+    strip_metadata: true,
+    grayscale: false,
+    cleanup: HIGH_CLEANUP,
+};
+
+const EXTREME_PRESET: LevelPreset = LevelPreset {
+    jpeg_quality: 40,
+    target_dpi: Some(96),
+    deflate_level: 9,
+    png_effort: 6,
+    strip_metadata: true,
+    grayscale: true,
+    cleanup: EXTREME_CLEANUP,
+};
+
 impl CompressionLevel {
     pub fn preset(self) -> LevelPreset {
         match self {
-            Self::Low => LevelPreset {
-                jpeg_quality: 90,
-                target_dpi: None,
-                deflate_level: 6,
-                png_effort: 2,
-                strip_metadata: false,
-                grayscale: false,
-                cleanup: CleanupPolicy {
-                    remove_markup_annotations: false,
-                    remove_forms: false,
-                    remove_struct_tree: false,
-                    remove_embedded_files: false,
-                    remove_output_intents: false,
-                },
-            },
-            Self::Medium => LevelPreset {
-                jpeg_quality: 75,
-                target_dpi: Some(200),
-                deflate_level: 9,
-                png_effort: 4,
-                strip_metadata: false,
-                grayscale: false,
-                cleanup: CleanupPolicy {
-                    remove_markup_annotations: false,
-                    remove_forms: false,
-                    remove_struct_tree: false,
-                    remove_embedded_files: false,
-                    remove_output_intents: false,
-                },
-            },
-            Self::High => LevelPreset {
-                jpeg_quality: 60,
-                target_dpi: Some(150),
-                deflate_level: 9,
-                png_effort: 5,
-                strip_metadata: true,
-                grayscale: false,
-                cleanup: CleanupPolicy {
-                    remove_markup_annotations: true,
-                    remove_forms: false,
-                    remove_struct_tree: true,
-                    remove_embedded_files: true,
-                    remove_output_intents: false,
-                },
-            },
-            Self::Extreme => LevelPreset {
-                jpeg_quality: 40,
-                target_dpi: Some(96),
-                deflate_level: 9,
-                png_effort: 6,
-                strip_metadata: true,
-                grayscale: true,
-                cleanup: CleanupPolicy {
-                    remove_markup_annotations: true,
-                    remove_forms: true,
-                    remove_struct_tree: true,
-                    remove_embedded_files: true,
-                    remove_output_intents: true,
-                },
-            },
+            Self::Low => LOW_PRESET,
+            Self::Medium => MEDIUM_PRESET,
+            Self::High => HIGH_PRESET,
+            Self::Extreme => EXTREME_PRESET,
         }
     }
 }

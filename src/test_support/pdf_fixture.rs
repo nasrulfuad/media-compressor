@@ -497,13 +497,13 @@ impl PdfFixture {
         self
     }
 
-    pub fn with_identity_cid_font(mut self, font_program: &[u8]) -> Self {
+    fn add_cid_font_descriptor(&mut self, font_program: &[u8]) -> ObjectId {
         let font_file = flate_stream(
             dictionary! { "Length1" => font_program.len() as i64 },
             font_program,
         );
         let font_file_id = self.document.add_object(font_file);
-        let descriptor_id = self.document.add_object(dictionary! {
+        self.document.add_object(dictionary! {
             "Type" => "FontDescriptor",
             "FontName" => "TestFont",
             "Flags" => 4,
@@ -514,7 +514,11 @@ impl PdfFixture {
             "CapHeight" => 700,
             "StemV" => 80,
             "FontFile2" => font_file_id,
-        });
+        })
+    }
+
+    pub fn with_identity_cid_font(mut self, font_program: &[u8]) -> Self {
+        let descriptor_id = self.add_cid_font_descriptor(font_program);
         let descendant_id = self.document.add_object(dictionary! {
             "Type" => "Font",
             "Subtype" => "CIDFontType2",

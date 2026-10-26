@@ -4,7 +4,7 @@ Goal: apply clean architecture, full unit test coverage, no comments in Rust sou
 
 This plan is written for an executor model. Follow it literally. When something in the codebase contradicts the plan, or a step cannot be done as written, **stop and ask the user**. Do not improvise a different design.
 
-Status: **P0–P6 implemented** on branch `refactor/clean-architecture`. P4 (identity CID font subsetting with usage walker, CIDToGIDMap rebuild, subset tags), P5 (bounded decode, `--max-input-size`, symlink-safe discovery, atomic writes, batch failure tests) and P6 (pure engines, batch CLI parity, extension from resolved format, NoProgress for `--json`/`--quiet`, PNG predictor 15 for Flate images, `anyhow` removed) are done. CLI help already lives in `#[arg(help = ...)]` attributes (part of P7.1). Open: P7 (comments left in `tests/integration_test.rs`, `summary.md` translation, readability sweep, `no-comments` in `make check`) and P8 (integration test split, coverage gate, `CLAUDE.md`/README updates). The D9 font test is `#[ignore]` until `tests/fixtures/fonts/test-font.ttf` exists; it passed locally with a temporary system font.
+Status: **P0–P8 implemented** on branch `refactor/clean-architecture`. `make check` (tests, clippy, fmt, no-comments) passes and `make coverage` reports 96.4% line coverage against the 90% gate. Integration tests are split into `cli_*` files, `summary.md` is in English, `README.md` and `CLAUDE.md` describe the new layout. The D9 font test stays `#[ignore]` until `tests/fixtures/fonts/test-font.ttf` is added; it passed locally with a temporary system font.
 
 ---
 

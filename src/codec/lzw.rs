@@ -89,6 +89,23 @@ fn invalid(message: &str) -> AppError {
     AppError::Decompress(format!("invalid LZW data: {message}"))
 }
 
+fn entry_for_code(
+    dictionary: &Dictionary,
+    previous: &Option<Vec<u8>>,
+    code: u16,
+) -> AppResult<Vec<u8>> {
+    match (previous, dictionary.lookup(code)) {
+        (_, Some(entry)) => Ok(entry),
+        (Some(previous_entry), None) if usize::from(code) == dictionary.next_code() => {
+            let mut entry = previous_entry.clone();
+            entry.push(previous_entry[0]);
+            Ok(entry)
+        }
+        (None, None) => Err(invalid("first code after clear is not a literal")),
+        (Some(_), None) => Err(invalid("code outside dictionary")),
+    }
+}
+
 pub fn lzw_decode(data: &[u8], settings: LzwSettings) -> AppResult<Vec<u8>> {
     let mut reader = BitReader::new(data);
     let mut dictionary = Dictionary::new();
@@ -106,16 +123,7 @@ pub fn lzw_decode(data: &[u8], settings: LzwSettings) -> AppResult<Vec<u8>> {
         if code == LZW_END_OF_DATA_CODE {
             break;
         }
-        let entry = match (&previous, dictionary.lookup(code)) {
-            (_, Some(entry)) => entry,
-            (Some(previous_entry), None) if usize::from(code) == dictionary.next_code() => {
-                let mut entry = previous_entry.clone();
-                entry.push(previous_entry[0]);
-                entry
-            }
-            (None, None) => return Err(invalid("first code after clear is not a literal")),
-            (Some(_), None) => return Err(invalid("code outside dictionary")),
-        };
+        let entry = entry_for_code(&dictionary, &previous, code)?;
         if output.len() + entry.len() > settings.max_output_bytes {
             return Err(AppError::DecompressionLimitExceeded {
                 limit: settings.max_output_bytes,

@@ -3,7 +3,7 @@ use std::fmt::Write;
 use colored::{ColoredString, Colorize};
 use humansize::{format_size, DECIMAL};
 
-use crate::domain::media::{Dimensions, ImageFormat};
+use crate::domain::media::Dimensions;
 use crate::domain::report::{
     BatchReport, FileOutcome, FileReport, InfoReport, MediaDetails, SizeStats,
 };
@@ -58,6 +58,18 @@ fn write_row(out: &mut String, width: usize, label: &str, value: impl std::fmt::
     let _ = writeln!(out, "  {:<width$} {}", label.dimmed(), value, width = width);
 }
 
+fn file_row(out: &mut String, label: &str, value: impl std::fmt::Display) {
+    write_row(out, FILE_LABEL_WIDTH, label, value);
+}
+
+fn batch_row(out: &mut String, label: &str, value: impl std::fmt::Display) {
+    write_row(out, BATCH_LABEL_WIDTH, label, value);
+}
+
+fn info_row(out: &mut String, label: &str, value: impl std::fmt::Display) {
+    write_row(out, INFO_LABEL_WIDTH, label, value);
+}
+
 fn dry_run_suffix(dry_run: bool, text: &str) -> String {
     if dry_run {
         text.yellow().to_string()
@@ -73,46 +85,49 @@ fn media_title(details: &MediaDetails) -> &'static str {
     }
 }
 
-fn write_image_rows(
-    out: &mut String,
-    input_format: ImageFormat,
-    output_format: ImageFormat,
-    original: Dimensions,
-    output: Dimensions,
-) {
+fn write_image_rows(out: &mut String, details: &MediaDetails) {
+    let MediaDetails::Image {
+        input_format,
+        output_format,
+        original_dimensions,
+        output_dimensions,
+    } = details
+    else {
+        return;
+    };
     if input_format == output_format {
-        write_row(
-            out,
-            FILE_LABEL_WIDTH,
-            "Format:",
-            input_format.display_name().white(),
-        );
+        file_row(out, "Format:", input_format.display_name().white());
     } else {
         let change = format!(
             "{} → {}",
             input_format.display_name().white(),
             output_format.display_name().green()
         );
-        write_row(out, FILE_LABEL_WIDTH, "Format:", change);
+        file_row(out, "Format:", change);
     }
-    let dimensions = if original == output {
-        format!("{}×{}", original.width, original.height)
-    } else {
-        format!(
-            "{}×{} → {}×{}",
-            original.width,
-            original.height,
-            output.width.to_string().green(),
-            output.height.to_string().green()
-        )
-    };
-    write_row(out, FILE_LABEL_WIDTH, "Dimensions:", dimensions);
+    file_row(
+        out,
+        "Dimensions:",
+        format_dimensions(*original_dimensions, *output_dimensions),
+    );
+}
+
+fn format_dimensions(original: Dimensions, output: Dimensions) -> String {
+    if original == output {
+        return format!("{}×{}", original.width, original.height);
+    }
+    format!(
+        "{}×{} → {}×{}",
+        original.width,
+        original.height,
+        output.width.to_string().green(),
+        output.height.to_string().green()
+    )
 }
 
 fn write_size_rows(out: &mut String, sizes: &SizeStats, dry_run: bool) {
-    write_row(
+    file_row(
         out,
-        FILE_LABEL_WIDTH,
         "Original size:",
         format_size(sizes.original_size, DECIMAL).white(),
     );
@@ -121,24 +136,13 @@ fn write_size_rows(out: &mut String, sizes: &SizeStats, dry_run: bool) {
     } else {
         "Compressed size:"
     };
-    write_row(
+    file_row(
         out,
-        FILE_LABEL_WIDTH,
         label,
         color_size(sizes.compressed_size, sizes.bytes_saved),
     );
-    write_row(
-        out,
-        FILE_LABEL_WIDTH,
-        "Bytes saved:",
-        format_saved(sizes.bytes_saved),
-    );
-    write_row(
-        out,
-        FILE_LABEL_WIDTH,
-        "Reduction ratio:",
-        color_ratio(sizes.ratio),
-    );
+    file_row(out, "Bytes saved:", format_saved(sizes.bytes_saved));
+    file_row(out, "Reduction ratio:", color_ratio(sizes.ratio));
 }
 
 pub fn render_file_report(report: &FileReport) -> String {
@@ -148,47 +152,29 @@ pub fn render_file_report(report: &FileReport) -> String {
     let _ = writeln!(out, "{rule}");
     let _ = writeln!(out, "{} {}", media_title(&report.details).bold(), suffix);
     let _ = writeln!(out, "{rule}");
-    write_row(
+    file_row(
         &mut out,
-        FILE_LABEL_WIDTH,
         "Input:",
         report.input_path.display().to_string().cyan(),
     );
     if !report.dry_run {
-        write_row(
+        file_row(
             &mut out,
-            FILE_LABEL_WIDTH,
             "Output:",
             report.output_path.display().to_string().cyan(),
         );
     }
-    if let MediaDetails::Image {
-        input_format,
-        output_format,
-        original_dimensions,
-        output_dimensions,
-    } = &report.details
-    {
-        write_image_rows(
-            &mut out,
-            *input_format,
-            *output_format,
-            *original_dimensions,
-            *output_dimensions,
-        );
-    }
+    write_image_rows(&mut out, &report.details);
     write_size_rows(&mut out, &report.sizes, report.dry_run);
     if report.kept_original {
-        write_row(
+        file_row(
             &mut out,
-            FILE_LABEL_WIDTH,
             "Note:",
             "output not smaller; original bytes kept".yellow(),
         );
     }
-    write_row(
+    file_row(
         &mut out,
-        FILE_LABEL_WIDTH,
         "Duration:",
         format!("{}ms", report.duration_ms).white(),
     );
@@ -197,9 +183,8 @@ pub fn render_file_report(report: &FileReport) -> String {
 }
 
 fn write_batch_totals(out: &mut String, report: &BatchReport) {
-    write_row(
+    batch_row(
         out,
-        BATCH_LABEL_WIDTH,
         "Total original:",
         format_size(report.total_original_bytes, DECIMAL).white(),
     );
@@ -208,68 +193,35 @@ fn write_batch_totals(out: &mut String, report: &BatchReport) {
     } else {
         "Total compressed:"
     };
-    write_row(
+    batch_row(
         out,
-        BATCH_LABEL_WIDTH,
         label,
         color_size(report.total_compressed_bytes, report.total_bytes_saved),
     );
-    write_row(
-        out,
-        BATCH_LABEL_WIDTH,
-        "Total saved:",
-        format_saved(report.total_bytes_saved),
-    );
-    write_row(
-        out,
-        BATCH_LABEL_WIDTH,
-        "Overall reduction:",
-        color_ratio(report.overall_ratio),
-    );
+    batch_row(out, "Total saved:", format_saved(report.total_bytes_saved));
+    batch_row(out, "Overall reduction:", color_ratio(report.overall_ratio));
 }
 
 fn write_batch_counts(out: &mut String, report: &BatchReport) {
-    write_row(
+    batch_row(
         out,
-        BATCH_LABEL_WIDTH,
         "Input dir:",
         report.input_dir.display().to_string().cyan(),
     );
     if !report.dry_run {
-        write_row(
+        batch_row(
             out,
-            BATCH_LABEL_WIDTH,
             "Output dir:",
             report.output_dir.display().to_string().cyan(),
         );
     }
-    write_row(
-        out,
-        BATCH_LABEL_WIDTH,
-        "Total files:",
-        report.total_files.to_string().white(),
-    );
-    write_row(
-        out,
-        BATCH_LABEL_WIDTH,
-        "Succeeded:",
-        report.succeeded.to_string().green(),
-    );
+    batch_row(out, "Total files:", report.total_files.to_string().white());
+    batch_row(out, "Succeeded:", report.succeeded.to_string().green());
     if report.skipped > 0 {
-        write_row(
-            out,
-            BATCH_LABEL_WIDTH,
-            "Skipped:",
-            report.skipped.to_string().yellow(),
-        );
+        batch_row(out, "Skipped:", report.skipped.to_string().yellow());
     }
     if report.failed > 0 {
-        write_row(
-            out,
-            BATCH_LABEL_WIDTH,
-            "Failed:",
-            report.failed.to_string().red(),
-        );
+        batch_row(out, "Failed:", report.failed.to_string().red());
     }
 }
 
@@ -305,9 +257,8 @@ pub fn render_batch_report(report: &BatchReport) -> String {
     let _ = writeln!(out, "{rule}");
     write_batch_counts(&mut out, report);
     write_batch_totals(&mut out, report);
-    write_row(
+    batch_row(
         &mut out,
-        BATCH_LABEL_WIDTH,
         "Duration:",
         format!("{}ms", report.duration_ms).white(),
     );
@@ -322,25 +273,14 @@ pub fn render_info_report(report: &InfoReport) -> String {
     let _ = writeln!(out, "{rule}");
     let _ = writeln!(out, "{}", "PDF Information".bold());
     let _ = writeln!(out, "{rule}");
-    write_row(&mut out, INFO_LABEL_WIDTH, "File:", report.path.cyan());
-    write_row(
+    info_row(&mut out, "File:", report.path.cyan());
+    info_row(
         &mut out,
-        INFO_LABEL_WIDTH,
         "Size:",
         format_size(report.file_size_bytes, DECIMAL).white(),
     );
-    write_row(
-        &mut out,
-        INFO_LABEL_WIDTH,
-        "Pages:",
-        report.page_count.to_string().white(),
-    );
-    write_row(
-        &mut out,
-        INFO_LABEL_WIDTH,
-        "PDF version:",
-        report.pdf_version.white(),
-    );
+    info_row(&mut out, "Pages:", report.page_count.to_string().white());
+    info_row(&mut out, "PDF version:", report.pdf_version.white());
     let _ = writeln!(out, "{rule}");
     out
 }
@@ -350,6 +290,7 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
+    use crate::domain::media::ImageFormat;
     use crate::domain::report::{BatchContext, FileResult};
 
     fn plain() {

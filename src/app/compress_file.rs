@@ -41,21 +41,22 @@ fn write_unless_dry_run(output: &Path, bytes: &[u8], write_mode: WriteMode) -> A
     write_atomically(output, bytes)
 }
 
-fn build_report(
-    request: &CompressRequest,
+struct CompletedRun {
     output_path: PathBuf,
     input_size: usize,
     compressed: CompressedMedia,
     started: Instant,
-) -> FileReport {
+}
+
+fn build_report(request: &CompressRequest, run: CompletedRun) -> FileReport {
     FileReport {
         input_path: request.input.clone(),
-        output_path,
-        sizes: SizeStats::new(input_size as u64, compressed.bytes.len() as u64),
-        kept_original: compressed.kept_original,
-        duration_ms: started.elapsed().as_millis() as u64,
+        output_path: run.output_path,
+        sizes: SizeStats::new(run.input_size as u64, run.compressed.bytes.len() as u64),
+        kept_original: run.compressed.kept_original,
+        duration_ms: run.started.elapsed().as_millis() as u64,
         dry_run: request.write_mode == WriteMode::DryRun,
-        details: compressed.details,
+        details: run.compressed.details,
     }
 }
 
@@ -79,10 +80,12 @@ pub fn compress_file(
     write_unless_dry_run(&output_path, &compressed.bytes, request.write_mode)?;
     Ok(build_report(
         request,
-        output_path,
-        input.len(),
-        compressed,
-        started,
+        CompletedRun {
+            output_path,
+            input_size: input.len(),
+            compressed,
+            started,
+        },
     ))
 }
 

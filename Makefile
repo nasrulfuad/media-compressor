@@ -141,8 +141,8 @@ fmt-check:
 fmt:
 	cargo fmt --all
 
-## Run all checks (test + lint + fmt) — run before committing
-check: test lint fmt-check
+## Run all checks (test + lint + fmt + no-comments) — run before committing
+check: test lint fmt-check no-comments
 
 ## Fail when Rust sources contain comments
 no-comments:
@@ -214,5 +214,6 @@ help:
 	@echo "  make lint                 Run clippy (zero warnings)"
 	@echo "  make fmt                  Format code"
 	@echo "  make fmt-check            Check formatting"
-	@echo "  make check                test + lint + fmt-check"
+	@echo "  make check                test + lint + fmt-check + no-comments"
+	@echo "  make coverage             Enforce 90% line coverage (cargo-llvm-cov)"
 	@echo "  make clean                Remove build artifacts"

@@ -128,6 +128,22 @@ fn validate_input_dir(input_dir: &Path) -> AppResult<()> {
     }
 }
 
+fn resolve_output_dir(request: &BatchRequest) -> PathBuf {
+    request
+        .output_dir
+        .clone()
+        .unwrap_or_else(|| default_batch_output_dir(&request.input_dir))
+}
+
+fn batch_context(request: &BatchRequest, output_dir: PathBuf, started: Instant) -> BatchContext {
+    BatchContext {
+        input_dir: request.input_dir.clone(),
+        output_dir,
+        duration_ms: started.elapsed().as_millis() as u64,
+        dry_run: request.write_mode == WriteMode::DryRun,
+    }
+}
+
 pub fn process_batch(
     request: &BatchRequest,
     registry: &CompressorRegistry,
@@ -135,10 +151,7 @@ pub fn process_batch(
 ) -> AppResult<BatchReport> {
     let started = Instant::now();
     validate_input_dir(&request.input_dir)?;
-    let output_dir = request
-        .output_dir
-        .clone()
-        .unwrap_or_else(|| default_batch_output_dir(&request.input_dir));
+    let output_dir = resolve_output_dir(request);
     let files = discover_files(&DiscoveryRequest {
         root: &request.input_dir,
         pattern: &request.pattern,
@@ -162,12 +175,7 @@ pub fn process_batch(
     let mut results = run_parallel(&job, &files, progress)?;
     progress.finish();
     results.sort_by(|left, right| left.path.cmp(&right.path));
-    let context = BatchContext {
-        input_dir: request.input_dir.clone(),
-        output_dir,
-        duration_ms: started.elapsed().as_millis() as u64,
-        dry_run: request.write_mode == WriteMode::DryRun,
-    };
+    let context = batch_context(request, output_dir, started);
     Ok(BatchReport::from_results(context, results))
 }
 

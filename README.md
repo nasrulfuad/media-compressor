@@ -12,7 +12,7 @@ Fast media compressor written in Rust. Compresses PDF and image files by recompr
 - **Stream optimization** — zlib recompression, LZW-to-Flate conversion, content stream merging, whitespace compaction
 - **Object cleanup** — remove thumbnails, JavaScript, non-link annotations, output intents, piece info, named destinations
 - **Stream deduplication** — find byte-identical streams and rewrite references
-- **Font optimization** — deduplicate identical font file streams, TrueType/OpenType glyph subsetting via content stream analysis (opt-in)
+- **Font optimization** — glyph subsetting for identity CID TrueType fonts, driven by a full content stream scan with `/CIDToGIDMap` rebuilt (opt-in)
 - **Inline image conversion** — convert BI/ID/EI inline images to XObject references
 - **Metadata stripping** — remove /Info dictionary and XMP metadata streams
 - **Structure tree removal** — strip /StructTreeRoot, /MarkInfo at high/extreme levels
@@ -21,10 +21,11 @@ Fast media compressor written in Rust. Compresses PDF and image files by recompr
 - **Atomic writes** — write to temp file, then rename; clean up on failure
 
 ### Image Compression
-- **Format detection** — JPEG, PNG, GIF, TIFF, BMP, WebP (via magic bytes)
-- **Format conversion** — convert between JPEG, PNG (WebP output planned)
+- **Format detection** — JPEG, PNG, GIF, TIFF, BMP, WebP via magic bytes; only JPEG and PNG can be compressed, other formats are rejected with a clear error
+- **Format conversion** — convert between JPEG and PNG
 - **Quality control** — configurable encoding quality (1-100)
-- **Lossless mode** — PNG/WebP lossless encode; JPEG input auto-converted to PNG
+- **Lossless mode** — JPEG input auto-converted to PNG; PDF images skip lossy re-encoding
+- **Alpha preserved** — PNG transparency and bit depth survive; JPEG output flattens onto white with a warning
 - **Resize** — max-dimension constraint with aspect ratio preserved (Lanczos3)
 - **Grayscale conversion** — single-channel luminance output
 - **Progressive JPEG** — enabled by default via mozjpeg
@@ -37,7 +38,7 @@ Fast media compressor written in Rust. Compresses PDF and image files by recompr
 - **Mixed media** — PDF and images in the same batch, auto-dispatched
 - **Resilient** — continue-on-error mode for large batches
 - **Progress indicator** — indicatif progress bars
-- **Default pattern** — `*.{pdf,jpg,jpeg,png,webp,tif,tiff,bmp,gif}`
+- **Default pattern** — `*.{pdf,jpg,jpeg,png}` (case-insensitive, symlinks are not followed)
 
 ### General
 - **Auto-detection** — file type identified from magic bytes, not extension
@@ -81,8 +82,8 @@ media-compressor compress photo.jpg --lossless  # converts JPEG → PNG
 # Grayscale conversion
 media-compressor compress photo.jpg --grayscale
 
-# Force metadata stripping
-media-compressor compress input.pdf --strip-metadata
+# High level strips metadata (use --keep-metadata to preserve it)
+media-compressor compress input.pdf --level high
 
 # Enable font optimization (PDF only)
 media-compressor compress input.pdf --compress-fonts
@@ -154,15 +155,15 @@ Global options:
 | `-o, --output <PATH>` | Output file path (default: `<input>_compressed.<ext>`) |
 | `-l, --level <LEVEL>` | Compression level: `low`, `medium`, `high`, `extreme` |
 | `--keep-metadata` | Preserve document metadata regardless of level |
-| `--strip-metadata` | Force metadata stripping (conflicts with `--keep-metadata`) |
 | `--image-quality <1-100>` | Override JPEG quality for PDF embedded images |
 | `--quality <1-100>` | Override encoding quality (images and PDF; takes precedence over `--image-quality`) |
 | `--dpi <NUM>` | Override target DPI for image downsampling |
-| `-f, --format <FMT>` | Output format for images: `original`, `jpeg`, `png`, `webp` |
+| `-f, --format <FMT>` | Output format for images: `original`, `jpeg`, `png` |
 | `--max-dimension <PX>` | Resize so no dimension exceeds PX (aspect ratio preserved) |
 | `--grayscale` | Convert to grayscale |
 | `--lossless` | Lossless mode (skip lossy recompression; JPEG → PNG) |
-| `--compress-fonts` | Enable font dedup + subsetting (PDF only, opt-in) |
+| `--compress-fonts` | Subset identity CID TrueType fonts (PDF only, opt-in) |
+| `--max-input-size <BYTES>` | Reject input files larger than BYTES (default 1 GiB) |
 | `--dry-run` | Estimate savings without writing output |
 | `--json` | Output report as JSON |
 | `--overwrite` | Overwrite existing output file |
@@ -174,14 +175,20 @@ Global options:
 | `INPUT_DIR` | Input directory path (positional, required) |
 | `-o, --output-dir <PATH>` | Output directory (default: `<input>_compressed`) |
 | `-l, --level <LEVEL>` | Compression level: `low`, `medium`, `high`, `extreme` |
-| `-p, --pattern <GLOB>` | Glob pattern (default: `*.{pdf,jpg,jpeg,png,webp,tif,tiff,bmp,gif}`) |
+| `-p, --pattern <GLOB>` | Glob pattern (default: `*.{pdf,jpg,jpeg,png}`) |
 | `-r, --recursive` | Recurse into subdirectories |
 | `-w, --workers <NUM>` | Parallel workers (0 = auto-detect CPU count) |
-| `--continue-on-error` | Skip failed files, continue batch |
+| `--continue-on-error` | Keep going after a failure (default: stop and skip the remaining files) |
 | `--keep-metadata` | Preserve document metadata |
-| `--image-quality <1-100>` | Override JPEG quality |
+| `--image-quality <1-100>` | Override JPEG quality of PDF images |
+| `--quality <1-100>` | Override encoding quality (PDF images and image files) |
+| `-f, --format <FMT>` | Output format for images: `original`, `jpeg`, `png` |
+| `--max-dimension <PX>` | Resize images so no side exceeds PX |
+| `--grayscale` | Convert to grayscale |
+| `--lossless` | Lossless mode |
 | `--dpi <NUM>` | Override target DPI |
-| `--compress-fonts` | Enable font dedup + subsetting (PDF only) |
+| `--max-input-size <BYTES>` | Reject input files larger than BYTES |
+| `--compress-fonts` | Subset identity CID TrueType fonts (PDF only) |
 | `--dry-run` | Estimate savings without writing |
 | `--json` | Output report as JSON |
 | `--overwrite` | Overwrite existing outputs |
@@ -200,75 +207,72 @@ Global options:
 | PDF | `%PDF` header | yes | yes | yes |
 | JPEG | `FF D8 FF` magic | yes | yes | - |
 | PNG | `89 50 4E 47` magic | yes | yes | - |
-| GIF | `GIF87a`/`GIF89a` magic | yes | yes | - |
-| TIFF | `49 49 2A 00` / `4D 4D 00 2A` magic | yes | yes | - |
-| BMP | `42 4D` magic | yes | yes | - |
-| WebP | `RIFF`+`WEBP` magic | yes | yes | - |
+| GIF | `GIF87a`/`GIF89a` magic | rejected | rejected | - |
+| TIFF | `49 49 2A 00` / `4D 4D 00 2A` magic | rejected | rejected | - |
+| BMP | `42 4D` magic | rejected | rejected | - |
+| WebP | `RIFF`+`WEBP` magic | rejected | rejected | - |
 
 ## Architecture
 
 ### PDF Compression Pipeline
 
-The compression pipeline runs in strict order (each step is isolated in its own module):
+The pipeline is a list of passes run in strict order on an in-memory document (`src/pdf/pipeline.rs`):
 
-1. **Load PDF** — validate magic bytes, parse with lopdf
-2. **Cleanup** — remove thumbnails, JavaScript, annotations, output intents, piece info, named destinations, struct tree, AcroForm, embedded files (level-dependent)
-3. **Stream dedup** — find byte-identical streams, rewrite references
-4. **Stream compression** — decompress + re-compress with zlib (LZW → Flate conversion)
-5. **Image compression** — DPI downsampling, complexity-aware quality, mozjpeg/oxipng re-encoding
-6. **Content stream merging** — merge multi-stream pages into single stream
-7. **Font dedup** (opt-in) — deduplicate identical font file streams
-8. **Font subsetting** (opt-in) — parse content streams for used glyphs, strip unused via `subsetter`
-9. **Inline image conversion** — convert BI/ID/EI to XObject references
-10. **Metadata stripping** — remove /Info and XMP (level-dependent)
-11. **Prune & renumber** — remove unreferenced objects, compact numbering
-12. **Save** — atomic write via temp file + rename
+1. **Parse** — validate the `%PDF-` header, reject encrypted files, parse with lopdf
+2. **Cleanup** — per level: thumbnails, JavaScript and piece info always; markup annotations, struct tree and embedded files at high; forms and output intents at extreme. Named destinations are never removed. Only references are removed, `prune_objects` deletes what becomes unreachable
+3. **Inline images** — convert `BI`/`ID`/`EI` to XObjects with the in-house content lexer, so they are compressed by later passes
+4. **Stream dedup** — merge streams whose dictionary and bytes are identical
+5. **Stream compression** — minify content streams with a tokenizer and re-deflate plain Flate/LZW streams; filter chains and predictors are left alone
+6. **Image compression** — DPI downsampling, complexity-aware quality; smallest of JPEG, PNG-predictor Flate and plain Flate wins
+7. **Content stream merging** — merge multi-stream pages
+8. **Font subsetting** (opt-in) — identity CID TrueType fonts only
+9. **Metadata stripping** — remove `/Info`, XMP and `/Metadata` references (level-dependent)
+10. **Prune, renumber, serialize** — if the result is not smaller the original bytes are returned
 
 ### Image Compression Pipeline
 
-1. **Detect format** — magic byte identification
-2. **Decode** — load to DynamicImage
+1. **Detect format** — magic bytes, only JPEG and PNG are decodable
+2. **Decode** — with image size and allocation limits
 3. **Transform** — resize (Lanczos3), grayscale conversion
-4. **Encode** — mozjpeg (JPEG) or oxipng (PNG) with quality/effort settings
-5. **Smart replace** — only write if result is smaller (same-format mode)
+4. **Encode** — mozjpeg (JPEG) or oxipng (PNG, alpha and bit depth preserved)
+5. **Smart replace** — keep the original bytes when a same-format result is not smaller
 
 ### Module Layout
 
 ```
 src/
-  main.rs                    # Entry point, command dispatch
+  main.rs                    # Entry point, exit codes
   lib.rs                     # Module declarations
-  error.rs                   # AppError enum (thiserror)
-  utils.rs                   # Shared helpers
-  cli/args.rs                # Clap derive structs
-  strategy/
-    mod.rs                   # CompressorStrategy trait, MediaType, ImageFormat enums
-    resolver.rs              # FileTypeResolver (magic bytes detection)
-    dispatcher.rs            # CompressorDispatcher (routes to correct engine)
-  compressor/
-    engine.rs                # PDF CompressorEngine — orchestrates pipeline
-    level.rs                 # CompressionLevel enum with preset methods
-    stream.rs                # FlateDecode/LZW decompression, zlib re-compression
-    image.rs                 # Embedded image compression (mozjpeg, oxipng, DPI)
-    cleanup.rs               # Remove unnecessary PDF objects
-    dedup.rs                 # Stream deduplication
-    font.rs                  # Font dedup + TrueType/OpenType subsetting
-    inline.rs                # Inline image → XObject conversion
-    metadata.rs              # Metadata stripping
-    pdf_utils.rs             # Shared: zlib helpers, constants, filter extraction
-  image_compressor/
-    engine.rs                # ImageCompressorEngine — orchestrates image pipeline
-    format.rs                # Format detection and resolution
-    jpeg.rs                  # JPEG encoding via mozjpeg
-    png.rs                   # PNG encoding via oxipng
-    transform.rs             # Resize, grayscale transforms
-    metadata.rs              # EXIF/XMP metadata handling
-  io/
-    reader.rs                # PDF loading + validation
-    writer.rs                # Atomic PDF saving
-  batch/processor.rs         # Parallel batch processing (rayon)
-  stats/report.rs            # CompressionReport, BatchReport, JSON output
+  error.rs                   # AppError enum (thiserror), exit codes
+  domain/                    # Media types, levels, options, reports (no I/O)
+  detection/                 # Magic-byte detection (single table)
+  codec/                     # zlib, LZW, mozjpeg, oxipng wrappers
+  pdf/
+    engine.rs                # compress_pdf_bytes: parse, run passes, never-bigger guard
+    pipeline.rs              # PdfPass trait and standard pass order
+    content_lexer.rs         # Content stream tokenizer (strings, comments, inline images)
+    content_minifier.rs      # Tokenizer-based content stream minification
+    filters.rs               # Filter chain / predictor aware stream decoding
+    font_usage.rs            # Glyph usage collection for font subsetting
+    object_graph.rs          # Reference resolution helpers
+    passes/                  # cleanup, inline_images, dedup, streams, images,
+                             # merge_content, fonts, metadata
+  raster/                    # Image engine (bytes in, bytes out), transforms, format resolution
+  fs/                        # Bounded reads, atomic writes, symlink-safe discovery
+  app/
+    media_compressor.rs      # MediaCompressor strategy trait
+    registry.rs              # CompressorRegistry (selects strategy by media type)
+    pdf_compressor.rs        # PDF strategy
+    image_compressor.rs      # Image strategy
+    compress_file.rs         # Media-agnostic single-file flow
+    batch.rs                 # Parallel batch processing (rayon, scoped pool)
+    info.rs                  # PDF info
+  presentation/              # Pretty and JSON rendering
+  cli/                       # clap args, request mapping, progress bar
+  test_support/              # Test-only fixture builders
 ```
+
+Adding a media type means one new `MediaCompressor` implementation plus one line in `CompressorRegistry::standard()`.
 
 ## Development
 
@@ -277,7 +281,8 @@ cargo build              # Build dev binary
 cargo test               # Run all tests
 cargo clippy -- -D warnings  # Lint (zero warnings policy)
 cargo fmt                # Format code
-make check               # All of the above
+make check               # test + clippy + fmt + no-comments
+make coverage            # 90% line coverage gate (needs cargo-llvm-cov)
 ```
 
 ### Benchmarks
@@ -291,8 +296,9 @@ cargo bench                    # Run all benchmarks
 
 Benchmarks cover:
 - **Compression levels** — low, medium, high, extreme compared side-by-side
-- **Dry-run overhead** — processing cost without file I/O
-- **Stream-only** — low level (minimal image work) to isolate stream compression cost
+- **Stream-only** — low level without resizing to isolate stream compression cost
+
+The benchmark builds its own sample PDF in memory, no input file is needed.
 
 ## License
 

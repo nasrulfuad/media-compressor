@@ -2,13 +2,13 @@
 
 ## Project Overview
 
-A Rust CLI tool for compressing PDF and image files. Supports single-file and batch compression with four compression levels (Low/Medium/High/Extreme). Uses `lopdf` for PDF manipulation, `mozjpeg`/`oxipng` for image re-encoding, and `flate2` for stream compression.
+A Rust CLI tool for compressing PDF and image files. Supports single-file and batch compression with four compression levels (Low/Medium/High/Extreme). Uses `lopdf` for PDF manipulation, `mozjpeg`/`oxipng` for image re-encoding, and `flate2` for stream compression. Only JPEG and PNG images are decodable; other image formats are rejected.
 
 ## Build & Run
 
 ```bash
 make build            # Debug build
-make build-release    # Optimized release build (LTO, strip, panic=abort)
+make build-release    # Optimized release build (LTO, strip)
 make run FILE=input.pdf LEVEL=medium
 make batch DIR=./pdfs LEVEL=high
 make dry-run FILE=input.pdf
@@ -20,85 +20,88 @@ make dry-run FILE=input.pdf
 make test             # cargo test --all-features
 make lint             # clippy -D warnings
 make fmt-check        # rustfmt check
-make check            # test + lint + fmt-check (run before committing)
+make check            # test + lint + fmt-check + no-comments (run before committing)
+make coverage         # cargo llvm-cov, fails under 90% line coverage
 make bench            # criterion benchmarks
 ```
 
 ## Architecture
 
-The compression pipeline runs in this order (defined in `src/compressor/engine.rs`):
+Single-file flow (`src/app/compress_file.rs`): bounded read → `detect_media_type` → `CompressorRegistry::find` → `MediaCompressor::compress` (bytes in, bytes out) → atomic write unless dry run. `app::compress_file` and `app::batch` never branch on media type.
 
-1. **Load PDF** (`src/io/reader.rs`) — validate magic bytes, parse with lopdf
-2. **Cleanup** (`src/compressor/cleanup.rs`) — remove thumbnails, JS, annotations, etc.
-3. **Stream dedup** (`src/compressor/dedup.rs`) — find byte-identical streams, rewrite refs
-4. **Stream compression** (`src/compressor/stream.rs`) — decompress + re-compress with zlib
-5. **Image compression** (`src/compressor/image.rs`) — DPI downsampling, quality adjustment, mozjpeg/oxipng re-encoding
-6. **Content stream merging** (`src/compressor/stream.rs`) — merge multi-stream pages
-7. **Font dedup & subsetting** (`src/compressor/font.rs`) — deduplicate fonts, strip unused glyphs via `subsetter`
-8. **Inline image conversion** (`src/compressor/inline.rs`) — convert BI/ID/EI to XObjects
-9. **Metadata stripping** (`src/compressor/metadata.rs`) — remove /Info and XMP
-10. **Prune & renumber** (lopdf) — remove unreferenced objects
-11. **Save** (`src/io/writer.rs`) — atomic write via temp file + rename
+The PDF pipeline is a list of `PdfPass` values in `src/pdf/pipeline.rs`, run in this order:
 
-Each step is isolated in its own module. The engine orchestrates.
+1. **Cleanup** (`pdf/passes/cleanup.rs`) — per level, removes references only
+2. **Inline images** (`inline_images.rs`) — BI/ID/EI to XObjects, so later passes compress them
+3. **Stream dedup** (`dedup.rs`) — key is stream dictionary plus bytes
+4. **Stream compression** (`streams.rs`) — tokenizer-based content minification, re-deflate plain Flate/LZW streams
+5. **Image compression** (`images.rs`) — DPI downsampling, mozjpeg / PNG-predictor / plain Flate, smallest wins
+6. **Content stream merging** (`merge_content.rs`)
+7. **Font subsetting** (`fonts.rs`, opt-in) — identity CID TrueType fonts only, usage from `pdf/font_usage.rs`
+8. **Metadata stripping** (`metadata.rs`)
+
+Then prune, renumber, serialize. If the output is not smaller than the input, the original bytes are returned.
+
+Adding a media type: implement `MediaCompressor` in `src/app/` and register it in `CompressorRegistry::standard()`. Do not touch `compress_file` or `batch`.
 
 ## Module Layout
 
 ```
 src/
-  main.rs              # Entry point, command dispatch
+  main.rs              # Entry point, exit codes
   lib.rs               # Module declarations
-  error.rs             # AppError enum (thiserror), AppResult<T> alias
-  utils.rs             # Shared helpers (default_output_path)
-  cli/args.rs          # Clap derive structs
-  compressor/
-    engine.rs          # CompressorEngine — orchestrates pipeline
-    level.rs           # CompressionLevel enum with preset methods
-    stream.rs          # FlateDecode/LZW decompression, zlib re-compression
-    image.rs           # Image XObject compression (mozjpeg, oxipng, DPI)
-    cleanup.rs         # Remove unnecessary PDF objects
-    dedup.rs           # Stream deduplication
-    font.rs            # Font dedup + TrueType/OpenType subsetting
-    inline.rs          # Inline image → XObject conversion
-    metadata.rs        # Metadata stripping
-    pdf_utils.rs       # Shared: zlib helpers, constants, filter extraction
-  io/
-    reader.rs          # PDF loading + validation
-    writer.rs          # Atomic PDF saving
-  batch/processor.rs   # Parallel batch processing (rayon)
-  stats/report.rs      # CompressionReport, BatchReport, JSON output
+  error.rs             # AppError (thiserror), AppResult, exit codes
+  domain/              # media types, levels, options, reports (no I/O, no clap)
+  detection/           # magic-byte detection, one table
+  codec/               # zlib (bounded inflate), lzw, jpeg (mozjpeg), png (oxipng)
+  pdf/                 # engine, pipeline, content_lexer, content_minifier, filters,
+                       # font_usage, object_graph, passes/*
+  raster/              # image engine, transforms, format resolution
+  fs/                  # read_bounded, atomic_writer, discovery
+  app/                 # strategy trait, registry, per-media compressors,
+                       # compress_file, batch, info, output_path, progress
+  presentation/        # pretty and JSON rendering
+  cli/                 # clap args, request mapping, indicatif progress
+  test_support/        # test-only fixture builders (PdfFixture, image fixtures)
+tests/                 # assert_cmd integration tests
+benches/               # criterion, builds its own sample PDF
+scripts/               # check-no-comments.sh
 ```
 
 ## Code Conventions
 
-- **Error handling**: All functions return `AppResult<T>`. Use `?` for propagation. Use `thiserror` for enum variants, `anyhow::Context` only in `main.rs`.
+- **Error handling**: All functions return `AppResult<T>`. Use `?` for propagation. Use `thiserror` for enum variants; `main.rs` prints the error and exits with `AppError::exit_code()`.
 - **Logging**: Use `tracing` macros (`info!`, `debug!`, `warn!`). Always use structured fields: `warn!(object_id = ?id, error = %e, "message")`.
 - **Formatting**: `rustfmt.toml` — edition 2021, max_width 100. Run `make fmt` before committing.
 - **Linting**: `clippy.toml` — MSRV 1.75.0. Zero warnings policy (`-D warnings`).
 - **Borrow pattern**: When iterating `doc.objects` mutably, collect IDs first into `Vec<ObjectId>` to avoid simultaneous borrow conflicts.
-- **Filter handling**: Image XObjects (Subtype=Image) are processed only by `image.rs`. `stream.rs` must skip them. Other unsupported filters (JBIG2Decode, CCITTFaxDecode, JPXDecode) are left untouched with a `warn!`.
+- **Filter handling**: Image XObjects (Subtype=Image) are processed only by `passes/images.rs`; `passes/streams.rs` skips them. Only `StreamEncoding::is_plain_decodable` streams (none, one Flate, one LZW, no predictor) are rewritten. Other filters (JBIG2Decode, CCITTFaxDecode, JPXDecode, ASCII85, chains) are left untouched with a `warn!`.
+- **Content streams**: never use `lopdf::content::Content::decode` (it silently stops at `%` comments). Use `pdf::content_lexer::tokenize`.
 - **Atomic writes**: Always write to temp file first, then rename. Clean up temp on failure.
 - **Tests**: Unit tests in `#[cfg(test)] mod tests` within each module. Integration tests in `tests/`. Use `assert_cmd` + `predicates` for CLI tests.
 
 ## Compression Levels
 
-| Level    | JPEG Quality | DPI Target | Strip Metadata | Grayscale | Remove Struct Tree | Remove AcroForm |
+| Level    | JPEG Quality | DPI Target | Strip Metadata | Grayscale | Markup Annots / Struct Tree / Embedded Files | Forms / Output Intents |
 |----------|:---:|:---:|:---:|:---:|:---:|:---:|
-| Low      | 90  | None | No  | No  | No  | No  |
-| Medium   | 75  | 200  | No  | No  | No  | No  |
-| High     | 60  | 150  | Yes | No  | Yes | No  |
-| Extreme  | 40  | 96   | Yes | Yes | Yes | Yes |
+| Low      | 90  | None | No  | No  | Keep   | Keep   |
+| Medium   | 75  | 200  | No  | No  | Keep   | Keep   |
+| High     | 60  | 150  | Yes | No  | Remove | Keep   |
+| Extreme  | 40  | 96   | Yes | Yes | Remove | Remove |
+
+Thumbnails, JavaScript and piece info are removed at every level. Named destinations are never removed. Forms are kept when a signature field exists.
 
 ## Rules
 
 - Do NOT add new dependencies without explicit approval. The dependency set is intentionally minimal.
-- Do NOT modify the compression pipeline order without understanding cascading effects — the order is optimized (cleanup first reduces object count for later passes).
+- Do NOT modify the pass order in `pdf/pipeline.rs` without understanding cascading effects (cleanup first reduces object count, inline images before dedup and image compression).
+- Cleanup removes references only and never calls `doc.objects.remove`; `prune_objects` deletes what becomes unreachable.
 - Always run `make check` before considering work complete.
-- When adding new PDF filter support, update both `decompress_stream()` in `stream.rs` AND the filter handling in `image.rs` / `inline.rs` as appropriate.
+- When adding new PDF filter support, update `pdf/filters.rs` (`StreamEncoding`, `decode_plain_stream`) and the callers in `passes/images.rs` / `passes/inline_images.rs` as appropriate.
 - Never silently discard PDF data — unsupported filters must log a warning and leave the stream untouched.
 - Batch mode must be resilient: individual file failures should not abort the batch (controlled by `--continue-on-error`).
 - Image compression must only replace if the result is smaller — never make a PDF bigger.
-- Keep `pdf_utils.rs` as the single source of truth for shared constants and zlib helpers. Do not duplicate compression logic across modules.
+- Keep `codec/` as the single source of truth for zlib, LZW, JPEG and PNG encoding. Do not duplicate compression logic across modules.
 
 ### Language
 
@@ -106,9 +109,9 @@ src/
 
 ### Clean Architecture
 
-- Dependencies point inward: `cli`/`main.rs` → `strategy`/`batch` → engines (`compressor`, `image_compressor`) → domain types. Inner modules must never import outer ones (no `clap`, `colored`, or `println!` in engines or domain types).
-- Keep pure transformation logic separate from I/O. Engines operate on in-memory data (`lopdf::Document`, `DynamicImage`, byte buffers); file reading and writing stay in `io/` or thin wrappers.
-- Presentation (pretty printing, JSON formatting) belongs in `stats/`, not in engines, `batch/`, or `main.rs`.
+- Dependencies point inward: `main` → `cli` → `app` → `pdf`/`raster`/`fs`/`detection` → `codec` → `domain`. Inner modules must never import outer ones. Only `cli` imports `clap`; `pdf`, `raster` and `domain` never use `colored`, `indicatif`, or `println!`.
+- Keep pure transformation logic separate from I/O. Engines operate on in-memory data (`lopdf::Document`, `DynamicImage`, byte buffers); file reading and writing stay in `fs/` and `app/`.
+- Presentation (pretty printing, JSON formatting) belongs in `presentation/`, not in engines, `app/`, or `main.rs`.
 - One responsibility per module and per function. Split functions that grow beyond a single clear purpose.
 - No duplicated logic: shared encoders, detectors, and helpers live in exactly one module and are reused.
 - Do not add abstractions (traits, generics) that nothing uses. Every trait must have a real caller.
