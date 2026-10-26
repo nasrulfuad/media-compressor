@@ -1,8 +1,53 @@
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
 
-use crate::compressor::level::CompressionLevel;
-use crate::strategy::ImageOutputFormat;
+use crate::domain::level::CompressionLevel;
+use crate::domain::media::OutputFormat;
+
+/// Compression level preset accepted on the command line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum LevelArg {
+    /// Minimal compression — preserves near-original quality.
+    Low,
+    /// Balanced compression — good quality with significant size savings.
+    Medium,
+    /// Aggressive compression — lower quality, high size savings.
+    High,
+    /// Maximum compression — significant quality reduction for smallest file.
+    Extreme,
+}
+
+impl From<LevelArg> for CompressionLevel {
+    fn from(level: LevelArg) -> Self {
+        match level {
+            LevelArg::Low => CompressionLevel::Low,
+            LevelArg::Medium => CompressionLevel::Medium,
+            LevelArg::High => CompressionLevel::High,
+            LevelArg::Extreme => CompressionLevel::Extreme,
+        }
+    }
+}
+
+/// Output image format accepted on the command line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum FormatArg {
+    /// Keep the same format as the input.
+    Original,
+    /// Encode as JPEG (lossy).
+    Jpeg,
+    /// Encode as PNG (lossless).
+    Png,
+}
+
+impl From<FormatArg> for OutputFormat {
+    fn from(format: FormatArg) -> Self {
+        match format {
+            FormatArg::Original => OutputFormat::Original,
+            FormatArg::Jpeg => OutputFormat::Jpeg,
+            FormatArg::Png => OutputFormat::Png,
+        }
+    }
+}
 
 /// Fast media compressor — compress PDF and image files with configurable quality levels.
 #[derive(Debug, Parser)]
@@ -60,7 +105,7 @@ pub struct CompressArgs {
         value_name = "LEVEL",
         default_value = "medium"
     )]
-    pub level: CompressionLevel,
+    pub level: LevelArg,
 
     /// Preserve document metadata (author, creation date, etc.) regardless of level.
     #[arg(long = "keep-metadata")]
@@ -107,7 +152,7 @@ pub struct CompressArgs {
         value_name = "FMT",
         default_value = "original"
     )]
-    pub format: ImageOutputFormat,
+    pub format: FormatArg,
 
     /// Resize image so neither dimension exceeds PX pixels (aspect ratio preserved).
     ///
@@ -119,15 +164,9 @@ pub struct CompressArgs {
     #[arg(long = "grayscale")]
     pub grayscale: bool,
 
-    /// Strip metadata (EXIF for images, /Info+XMP for PDF).
-    ///
-    /// Default behaviour is determined by --level; this flag forces stripping.
-    #[arg(long = "strip-metadata", conflicts_with = "keep_metadata")]
-    pub strip_metadata: bool,
-
     /// Lossless compression mode.
     ///
-    /// For images: PNG/WebP lossless encode; JPEG input is converted to PNG.
+    /// For images: JPEG input is converted to PNG.
     /// For PDF: skip lossy image recompression.
     #[arg(long = "lossless")]
     pub lossless: bool,
@@ -161,14 +200,14 @@ pub struct BatchArgs {
         value_name = "LEVEL",
         default_value = "medium"
     )]
-    pub level: CompressionLevel,
+    pub level: LevelArg,
 
     /// Glob pattern to match files.
     #[arg(
         short = 'p',
         long = "pattern",
         value_name = "GLOB",
-        default_value = "*.{pdf,jpg,jpeg,png,webp,tif,tiff,bmp,gif}"
+        default_value = "*.{pdf,jpg,jpeg,png}"
     )]
     pub pattern: String,
 
@@ -243,7 +282,7 @@ mod tests {
         match cli.command {
             Commands::Compress(args) => {
                 assert_eq!(args.input, PathBuf::from("input.pdf"));
-                assert_eq!(args.level, CompressionLevel::Medium);
+                assert_eq!(args.level, LevelArg::Medium);
                 assert!(args.output.is_none());
                 assert!(!args.keep_metadata);
                 assert!(!args.dry_run);
@@ -279,7 +318,7 @@ mod tests {
             Commands::Compress(args) => {
                 assert_eq!(args.input, PathBuf::from("input.pdf"));
                 assert_eq!(args.output, Some(PathBuf::from("output.pdf")));
-                assert_eq!(args.level, CompressionLevel::High);
+                assert_eq!(args.level, LevelArg::High);
                 assert!(args.keep_metadata);
                 assert_eq!(args.image_quality, Some(80));
                 assert_eq!(args.dpi, Some(150));
@@ -348,8 +387,8 @@ mod tests {
             Commands::Batch(args) => {
                 assert_eq!(args.input_dir, PathBuf::from("/tmp/pdfs"));
                 assert!(args.output_dir.is_none());
-                assert_eq!(args.level, CompressionLevel::Medium);
-                assert_eq!(args.pattern, "*.{pdf,jpg,jpeg,png,webp,tif,tiff,bmp,gif}");
+                assert_eq!(args.level, LevelArg::Medium);
+                assert_eq!(args.pattern, "*.{pdf,jpg,jpeg,png}");
                 assert!(!args.recursive);
                 assert_eq!(args.workers, 0);
                 assert!(!args.continue_on_error);
@@ -392,7 +431,7 @@ mod tests {
             Commands::Batch(args) => {
                 assert_eq!(args.input_dir, PathBuf::from("/tmp/pdfs"));
                 assert_eq!(args.output_dir, Some(PathBuf::from("/tmp/out")));
-                assert_eq!(args.level, CompressionLevel::High);
+                assert_eq!(args.level, LevelArg::High);
                 assert_eq!(args.pattern, "report_*.pdf");
                 assert!(args.recursive);
                 assert_eq!(args.workers, 4);
@@ -421,17 +460,15 @@ mod tests {
             "--max-dimension",
             "1920",
             "--grayscale",
-            "--strip-metadata",
             "--lossless",
         ])
         .unwrap();
         match cli.command {
             Commands::Compress(args) => {
                 assert_eq!(args.quality, Some(75));
-                assert_eq!(args.format, ImageOutputFormat::Png);
+                assert_eq!(args.format, FormatArg::Png);
                 assert_eq!(args.max_dimension, Some(1920));
                 assert!(args.grayscale);
-                assert!(args.strip_metadata);
                 assert!(args.lossless);
             }
             _ => panic!("Expected Compress command"),
@@ -446,17 +483,56 @@ mod tests {
     }
 
     #[test]
-    fn strip_metadata_and_keep_metadata_conflict() {
-        let result = Cli::try_parse_from([
-            "media-compressor",
-            "compress",
-            "a.pdf",
-            "--strip-metadata",
-            "--keep-metadata",
-        ]);
-        assert!(
-            result.is_err(),
-            "--strip-metadata and --keep-metadata should conflict"
+    fn level_arg_converts_to_every_compression_level() {
+        let converted: Vec<CompressionLevel> = [
+            LevelArg::Low,
+            LevelArg::Medium,
+            LevelArg::High,
+            LevelArg::Extreme,
+        ]
+        .into_iter()
+        .map(CompressionLevel::from)
+        .collect();
+        assert_eq!(
+            converted,
+            vec![
+                CompressionLevel::Low,
+                CompressionLevel::Medium,
+                CompressionLevel::High,
+                CompressionLevel::Extreme
+            ]
         );
+    }
+
+    #[test]
+    fn format_arg_converts_to_output_format() {
+        assert_eq!(
+            OutputFormat::from(FormatArg::Original),
+            OutputFormat::Original
+        );
+        assert_eq!(OutputFormat::from(FormatArg::Jpeg), OutputFormat::Jpeg);
+        assert_eq!(OutputFormat::from(FormatArg::Png), OutputFormat::Png);
+    }
+
+    #[test]
+    fn webp_format_is_rejected_by_the_parser() {
+        let result = Cli::try_parse_from(["media-compressor", "compress", "a.jpg", "-f", "webp"]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn removed_strip_metadata_flag_is_rejected() {
+        let result =
+            Cli::try_parse_from(["media-compressor", "compress", "a.pdf", "--strip-metadata"]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn default_batch_pattern_lists_only_decodable_media() {
+        let cli = Cli::try_parse_from(["media-compressor", "batch", "dir"]).unwrap();
+        match cli.command {
+            Commands::Batch(args) => assert_eq!(args.pattern, "*.{pdf,jpg,jpeg,png}"),
+            _ => panic!("Expected Batch command"),
+        }
     }
 }

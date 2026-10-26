@@ -1,135 +1,124 @@
-//! Compression benchmarks using criterion.
-//!
-//! Requires `inputs/sample.pdf` in the project root.  If absent, benchmarks are
-//! skipped with a warning rather than failing the build.
-//!
-//! Run with: `cargo bench`
-//! HTML report: `target/criterion/report/index.html`
-
-use std::path::PathBuf;
+use std::io::Write;
 use std::time::Duration;
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, SamplingMode};
-use tempfile::TempDir;
+use flate2::write::ZlibEncoder;
+use flate2::Compression;
+use lopdf::{dictionary, Document, Object, Stream};
 
-use media_compressor::compressor::engine::CompressorEngine;
-use media_compressor::compressor::level::CompressionLevel;
+use media_compressor::domain::level::CompressionLevel;
+use media_compressor::domain::options::PdfOptions;
+use media_compressor::pdf::engine::compress_pdf_bytes;
 
-/// Locate the sample PDF used for benchmarks.
-fn sample_pdf() -> Option<PathBuf> {
-    let candidates = [
-        PathBuf::from("inputs/sample.pdf"),
-        PathBuf::from("tests/fixtures/with_images.pdf"),
-    ];
-    candidates.into_iter().find(|p| p.exists())
+const IMAGE_SIDE: u32 = 1024;
+const CONTENT_REPEATS: usize = 400;
+const SAMPLE_COUNT: usize = 10;
+const MEASUREMENT_SECONDS: u64 = 60;
+const WARM_UP_SECONDS: u64 = 5;
+
+fn deflate(data: &[u8]) -> Vec<u8> {
+    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::fast());
+    encoder.write_all(data).expect("deflate write");
+    encoder.finish().expect("deflate finish")
 }
 
-/// Configure a benchmark group for PDF compression workloads.
-///
-/// PDF compression is CPU-intensive (seconds per iteration), so we use:
-/// - `sample_size(10)` — fewer iterations to keep total time reasonable
-/// - `measurement_time(60s)` — enough wall time for 10 samples of multi-second ops
-/// - `warm_up_time(5s)` — warm up caches and JIT before measuring
-/// - `SamplingMode::Flat` — each iteration measured independently
+fn gradient_rgb_bytes(side: u32) -> Vec<u8> {
+    (0..side * side * 3)
+        .map(|index| {
+            let pixel = index / 3;
+            ((pixel % side + pixel / side) % 256) as u8
+        })
+        .collect()
+}
+
+fn image_stream(side: u32) -> Stream {
+    Stream::new(
+        dictionary! {
+            "Type" => "XObject",
+            "Subtype" => "Image",
+            "Width" => i64::from(side),
+            "Height" => i64::from(side),
+            "ColorSpace" => "DeviceRGB",
+            "BitsPerComponent" => 8,
+            "Filter" => "FlateDecode",
+        },
+        deflate(&gradient_rgb_bytes(side)),
+    )
+}
+
+fn sample_pdf_bytes() -> Vec<u8> {
+    let mut document = Document::with_version("1.5");
+    let pages_id = document.new_object_id();
+    let image_id = document.add_object(image_stream(IMAGE_SIDE));
+    let content = b"q 400 0 0 400 50 50 cm /Im1 Do Q BT /F1 12 Tf (Sample text) Tj ET\n"
+        .repeat(CONTENT_REPEATS);
+    let content_id = document.add_object(Stream::new(lopdf::Dictionary::new(), content));
+    let page_id = document.add_object(dictionary! {
+        "Type" => "Page",
+        "Parent" => pages_id,
+        "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+        "Contents" => content_id,
+        "Resources" => dictionary! { "XObject" => dictionary! { "Im1" => image_id } },
+    });
+    document.objects.insert(
+        pages_id,
+        Object::Dictionary(dictionary! {
+            "Type" => "Pages",
+            "Kids" => vec![Object::Reference(page_id)],
+            "Count" => 1,
+        }),
+    );
+    let catalog_id = document.add_object(dictionary! {
+        "Type" => "Catalog",
+        "Pages" => pages_id,
+    });
+    document.trailer.set("Root", catalog_id);
+    let mut bytes = Vec::new();
+    document.save_to(&mut bytes).expect("serialize sample pdf");
+    bytes
+}
+
 fn configure_group(group: &mut criterion::BenchmarkGroup<criterion::measurement::WallTime>) {
-    group.sample_size(10);
-    group.measurement_time(Duration::from_secs(60));
-    group.warm_up_time(Duration::from_secs(5));
+    group.sample_size(SAMPLE_COUNT);
+    group.measurement_time(Duration::from_secs(MEASUREMENT_SECONDS));
+    group.warm_up_time(Duration::from_secs(WARM_UP_SECONDS));
     group.sampling_mode(SamplingMode::Flat);
 }
 
-/// Benchmark compression across all four levels using a real PDF.
-fn bench_compression_levels(c: &mut Criterion) {
-    let input = match sample_pdf() {
-        Some(p) => p,
-        None => {
-            eprintln!(
-                "WARNING: No sample PDF found (inputs/sample.pdf or tests/fixtures/with_images.pdf). \
-                 Skipping compression benchmarks."
-            );
-            return;
-        }
-    };
-
-    let file_size = std::fs::metadata(&input).map(|m| m.len()).unwrap_or(0);
-    let mut group = c.benchmark_group("compress_levels");
+fn bench_compression_levels(criterion: &mut Criterion) {
+    let input = sample_pdf_bytes();
+    let mut group = criterion.benchmark_group("compress_levels");
     configure_group(&mut group);
-
     let levels = [
         CompressionLevel::Low,
         CompressionLevel::Medium,
         CompressionLevel::High,
         CompressionLevel::Extreme,
     ];
-
-    for level in &levels {
+    for level in levels {
+        let options = PdfOptions::for_level(level);
         group.bench_with_input(
-            BenchmarkId::new(level.to_string(), format!("{:.0}KB", file_size / 1024)),
+            BenchmarkId::new(level.to_string(), format!("{}KB", input.len() / 1024)),
             &input,
-            |b, input_path| {
-                b.iter(|| {
-                    let tmp = TempDir::new().unwrap();
-                    let output = tmp.path().join("out.pdf");
-                    let engine = CompressorEngine::new(*level);
-                    engine.compress(input_path, &output).unwrap();
-                });
+            |bencher, bytes| {
+                bencher.iter(|| compress_pdf_bytes(bytes, &options).expect("compress sample pdf"));
             },
         );
     }
-
     group.finish();
 }
 
-/// Benchmark dry-run mode (no I/O write) to measure pure processing overhead.
-fn bench_dry_run(c: &mut Criterion) {
-    let input = match sample_pdf() {
-        Some(p) => p,
-        None => return,
-    };
-
-    let mut group = c.benchmark_group("dry_run");
+fn bench_streams_only(criterion: &mut Criterion) {
+    let input = sample_pdf_bytes();
+    let mut options = PdfOptions::for_level(CompressionLevel::Low);
+    options.target_dpi = None;
+    let mut group = criterion.benchmark_group("streams_only");
     configure_group(&mut group);
-
-    group.bench_function("medium_dry_run", |b| {
-        b.iter(|| {
-            let tmp = TempDir::new().unwrap();
-            let output = tmp.path().join("out.pdf");
-            let mut engine = CompressorEngine::new(CompressionLevel::Medium);
-            engine.dry_run = true;
-            engine.compress(&input, &output).unwrap();
-        });
+    group.bench_function("low_without_resize", |bencher| {
+        bencher.iter(|| compress_pdf_bytes(&input, &options).expect("compress sample pdf"));
     });
-
     group.finish();
 }
 
-/// Benchmark individual phases by comparing with/without image compression.
-fn bench_stream_only(c: &mut Criterion) {
-    let input = match sample_pdf() {
-        Some(p) => p,
-        None => return,
-    };
-
-    let mut group = c.benchmark_group("stream_only");
-    configure_group(&mut group);
-
-    // Low level with no DPI target = minimal image work, mostly stream compression.
-    group.bench_function("low_no_image_resize", |b| {
-        b.iter(|| {
-            let tmp = TempDir::new().unwrap();
-            let output = tmp.path().join("out.pdf");
-            let engine = CompressorEngine::new(CompressionLevel::Low);
-            engine.compress(&input, &output).unwrap();
-        });
-    });
-
-    group.finish();
-}
-
-criterion_group!(
-    benches,
-    bench_compression_levels,
-    bench_dry_run,
-    bench_stream_only
-);
+criterion_group!(benches, bench_compression_levels, bench_streams_only);
 criterion_main!(benches);

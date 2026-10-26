@@ -1,4 +1,4 @@
-.PHONY: build build-release run batch dry-run info test test-verbose bench lint fmt-check fmt check clean install help
+.PHONY: build build-release run batch dry-run info test test-verbose bench lint fmt-check fmt check no-comments coverage clean install help
 
 # Default target
 all: build
@@ -15,7 +15,7 @@ build-release:
 
 # ─── Compress Single File ─────────────────────────────────────────────────────
 #
-# Supports PDF and images (JPEG, PNG, GIF, TIFF, BMP, WebP).
+# Supports PDF and images (JPEG, PNG).
 # File type auto-detected from magic bytes.
 #
 # Variables:
@@ -24,12 +24,11 @@ build-release:
 #   LEVEL      Compression level: low|medium|high|extreme (default: medium)
 #   QUALITY    Encoding quality 1-100 (overrides level preset)
 #   DPI        Target DPI for image downsampling
-#   FORMAT     Output format for images: original|jpeg|png|webp
+#   FORMAT     Output format for images: original|jpeg|png
 #   MAXDIM     Max dimension in pixels (aspect ratio preserved)
 #   GRAYSCALE  Set to 1 for grayscale conversion
 #   LOSSLESS   Set to 1 for lossless mode (JPEG input → PNG)
 #   FONTS      Set to 1 to enable font dedup + subsetting (PDF only)
-#   STRIP_META Set to 1 to force metadata stripping
 #   KEEP_META  Set to 1 to preserve metadata regardless of level
 #   OVERWRITE  Set to 1 to overwrite existing output
 #   DRYRUN     Set to 1 for dry-run mode
@@ -38,8 +37,8 @@ build-release:
 run:
 	@if [ -z "$(FILE)" ]; then \
 		echo "Usage: make run FILE=<input> [LEVEL=medium] [QUALITY=75] [DPI=150]"; \
-		echo "       [FORMAT=jpeg|png|webp] [MAXDIM=1920] [GRAYSCALE=1]"; \
-		echo "       [LOSSLESS=1] [FONTS=1] [STRIP_META=1] [KEEP_META=1]"; \
+		echo "       [FORMAT=jpeg|png] [MAXDIM=1920] [GRAYSCALE=1]"; \
+		echo "       [LOSSLESS=1] [FONTS=1] [KEEP_META=1]"; \
 		echo "       [OUTPUT=out.pdf] [OVERWRITE=1] [DRYRUN=1] [JSON=1]"; \
 		exit 1; \
 	fi
@@ -53,7 +52,6 @@ run:
 		$(if $(filter 1,$(GRAYSCALE)),--grayscale) \
 		$(if $(filter 1,$(LOSSLESS)),--lossless) \
 		$(if $(filter 1,$(FONTS)),--compress-fonts) \
-		$(if $(filter 1,$(STRIP_META)),--strip-metadata) \
 		$(if $(filter 1,$(KEEP_META)),--keep-metadata) \
 		$(if $(filter 1,$(OVERWRITE)),--overwrite) \
 		$(if $(filter 1,$(DRYRUN)),--dry-run) \
@@ -62,7 +60,7 @@ run:
 # ─── Batch Compress Directory ─────────────────────────────────────────────────
 #
 # Compress all supported files (PDF + images) in a directory.
-# Default pattern: *.{pdf,jpg,jpeg,png,webp,tif,tiff,bmp,gif}
+# Default pattern: *.{pdf,jpg,jpeg,png}
 #
 # Variables:
 #   DIR        (required) Input directory path
@@ -146,6 +144,14 @@ fmt:
 ## Run all checks (test + lint + fmt) — run before committing
 check: test lint fmt-check
 
+## Fail when Rust sources contain comments
+no-comments:
+	./scripts/check-no-comments.sh
+
+## Enforce the line coverage gate on library unit tests
+coverage:
+	cargo llvm-cov --lib --fail-under-lines 90 --ignore-filename-regex 'test_support'
+
 # ─── Utility ──────────────────────────────────────────────────────────────────
 
 ## Remove build artifacts
@@ -171,12 +177,11 @@ help:
 	@echo "    LEVEL=medium              Compression level (low|medium|high|extreme)"
 	@echo "    QUALITY=75                Encoding quality 1-100"
 	@echo "    DPI=150                   Target DPI for downsampling"
-	@echo "    FORMAT=jpeg               Output format (jpeg|png|webp)"
+	@echo "    FORMAT=jpeg               Output format (jpeg|png)"
 	@echo "    MAXDIM=1920               Max dimension in pixels"
 	@echo "    GRAYSCALE=1               Convert to grayscale"
 	@echo "    LOSSLESS=1                Lossless mode"
 	@echo "    FONTS=1                   Enable font dedup + subsetting (PDF)"
-	@echo "    STRIP_META=1              Force metadata stripping"
 	@echo "    KEEP_META=1               Preserve metadata"
 	@echo "    OUTPUT=out.pdf            Custom output path"
 	@echo "    OVERWRITE=1               Overwrite existing output"

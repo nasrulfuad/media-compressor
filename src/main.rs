@@ -1,28 +1,30 @@
-use anyhow::{Context, Result};
+use std::process::ExitCode;
+
 use clap::Parser;
 use colored::Colorize;
-use tracing::info;
 
-use media_compressor::batch::processor::{self, BatchConfig};
-use media_compressor::cli::args::{Cli, Commands};
-use media_compressor::error::AppError;
-use media_compressor::io::reader::load_pdf;
-use media_compressor::strategy::{CompressorDispatcher, DispatchConfig};
-use media_compressor::utils::{default_image_output_path, default_output_path};
+use media_compressor::app::batch::process_batch;
+use media_compressor::app::compress_file::compress_file;
+use media_compressor::app::info::read_pdf_info;
+use media_compressor::app::registry::CompressorRegistry;
+use media_compressor::app::{BatchRequest, CompressRequest};
+use media_compressor::cli::args::{BatchArgs, Cli, Commands, CompressArgs, InfoArgs};
+use media_compressor::cli::progress::IndicatifProgress;
+use media_compressor::domain::options::DEFAULT_MAX_INPUT_BYTES;
+use media_compressor::error::{AppResult, EXIT_CODE_RUNTIME_ERROR};
+use media_compressor::presentation::json::to_pretty_json;
+use media_compressor::presentation::pretty::{
+    render_batch_report, render_file_report, render_info_report,
+};
 
-fn main() -> Result<()> {
-    let cli = Cli::parse();
-
-    // ── Logging setup ──────────────────────────────────────────────────────
-    // Respect -q/--quiet and -v/--verbose, but allow RUST_LOG to override.
-    let default_filter = if cli.quiet {
+fn init_logging(verbose: bool, quiet: bool) {
+    let default_filter = if quiet {
         "error"
-    } else if cli.verbose {
+    } else if verbose {
         "debug"
     } else {
         "info"
     };
-
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -31,190 +33,65 @@ fn main() -> Result<()> {
         .with_target(false)
         .with_writer(std::io::stderr)
         .init();
+}
 
-    // ── Command dispatch ───────────────────────────────────────────────────
-    match cli.command {
-        Commands::Compress(args) => {
-            // Resolve output path.
-            // For explicit format conversions (e.g. --format png), change extension.
-            let output_path = args.output.clone().unwrap_or_else(|| {
-                if let Some(ext) = args.format.extension() {
-                    default_image_output_path(&args.input, ext)
-                } else {
-                    default_output_path(&args.input)
-                }
-            });
+fn run_compress(args: CompressArgs) -> AppResult<ExitCode> {
+    let json = args.json;
+    let request = CompressRequest::from(args);
+    let report = compress_file(&request, &CompressorRegistry::standard())?;
+    if json {
+        println!("{}", to_pretty_json(&report)?);
+    } else {
+        print!("{}", render_file_report(&report));
+    }
+    Ok(ExitCode::SUCCESS)
+}
 
-            // Guard against accidental overwrites.
-            if !args.overwrite && !args.dry_run && output_path.exists() {
-                eprintln!(
-                    "{} Output file '{}' already exists. Use --overwrite to replace it.",
-                    "Error:".red().bold(),
-                    output_path.display()
-                );
-                std::process::exit(2);
-            }
+fn run_batch(args: BatchArgs) -> AppResult<ExitCode> {
+    let json = args.json;
+    let request = BatchRequest::from(args);
+    let report = process_batch(
+        &request,
+        &CompressorRegistry::standard(),
+        &IndicatifProgress::new(),
+    )?;
+    if json {
+        println!("{}", to_pretty_json(&report)?);
+    } else {
+        print!("{}", render_batch_report(&report));
+    }
+    if report.failed > 0 {
+        return Ok(ExitCode::from(EXIT_CODE_RUNTIME_ERROR));
+    }
+    Ok(ExitCode::SUCCESS)
+}
 
-            // Build dispatch configuration from CLI args.
-            let config = DispatchConfig {
-                level: args.level,
-                dry_run: args.dry_run,
-                keep_metadata: args.keep_metadata,
-                quality: args.quality,
-                format: args.format.clone(),
-                max_dimension: args.max_dimension,
-                // Combine explicit --grayscale with level preset (Extreme converts to grayscale).
-                grayscale: args.grayscale || args.level.convert_to_grayscale(),
-                strip_metadata: args.strip_metadata,
-                lossless: args.lossless,
-                pdf_image_quality: args.image_quality,
-                pdf_target_dpi: args.dpi,
-                pdf_compress_fonts: args.compress_fonts,
-            };
+fn run_info(args: InfoArgs) -> AppResult<ExitCode> {
+    let report = read_pdf_info(&args.input, DEFAULT_MAX_INPUT_BYTES)?;
+    if args.json {
+        println!("{}", to_pretty_json(&report)?);
+    } else {
+        print!("{}", render_info_report(&report));
+    }
+    Ok(ExitCode::SUCCESS)
+}
 
-            info!(
-                input = %args.input.display(),
-                output = %output_path.display(),
-                level = %args.level,
-                dry_run = args.dry_run,
-                "Starting compression"
-            );
+fn run(command: Commands) -> AppResult<ExitCode> {
+    match command {
+        Commands::Compress(args) => run_compress(args),
+        Commands::Batch(args) => run_batch(args),
+        Commands::Info(args) => run_info(args),
+    }
+}
 
-            // Detect file type and dispatch to the correct strategy.
-            let result = CompressorDispatcher
-                .compress(&config, &args.input, &output_path)
-                .with_context(|| format!("Failed to compress '{}'", args.input.display()))?;
-
-            // Print results.
-            if args.json {
-                let json = result
-                    .to_json()
-                    .with_context(|| "Failed to serialise report")?;
-                println!("{}", json);
-            } else {
-                result.print_pretty();
-            }
-        }
-
-        Commands::Batch(args) => {
-            // Validate input directory.
-            if !args.input_dir.is_dir() {
-                eprintln!(
-                    "{} '{}' is not a directory.",
-                    "Error:".red().bold(),
-                    args.input_dir.display()
-                );
-                std::process::exit(2);
-            }
-
-            // Resolve output directory.
-            let output_dir = args.output_dir.clone().unwrap_or_else(|| {
-                let mut name = args
-                    .input_dir
-                    .file_name()
-                    .unwrap_or_default()
-                    .to_os_string();
-                name.push("_compressed");
-                args.input_dir
-                    .parent()
-                    .unwrap_or_else(|| std::path::Path::new("."))
-                    .join(name)
-            });
-
-            let config = BatchConfig {
-                input_dir: args.input_dir.clone(),
-                output_dir: output_dir.clone(),
-                level: args.level,
-                pattern: args.pattern.clone(),
-                recursive: args.recursive,
-                workers: args.workers,
-                continue_on_error: args.continue_on_error,
-                keep_metadata: args.keep_metadata,
-                image_quality: args.image_quality,
-                target_dpi: args.dpi,
-                dry_run: args.dry_run,
-                overwrite: args.overwrite,
-                compress_fonts: args.compress_fonts,
-            };
-
-            info!(
-                input_dir = %config.input_dir.display(),
-                output_dir = %config.output_dir.display(),
-                level = %config.level,
-                pattern = %config.pattern,
-                recursive = config.recursive,
-                workers = config.workers,
-                "Starting batch compression"
-            );
-
-            let report =
-                processor::process_batch(&config).with_context(|| "Batch compression failed")?;
-
-            if args.json {
-                let json = report
-                    .to_json()
-                    .with_context(|| "Failed to serialise batch report")?;
-                println!("{}", json);
-            } else {
-                report.print_pretty();
-            }
-
-            // Exit non-zero if any files failed and continue-on-error was set.
-            if report.failed > 0 {
-                std::process::exit(1);
-            }
-        }
-
-        Commands::Info(args) => {
-            let doc = load_pdf(&args.input).map_err(|e| match e {
-                AppError::InvalidPdf(msg) => anyhow::anyhow!("Invalid PDF: {}", msg),
-                AppError::EncryptedPdf => {
-                    anyhow::anyhow!("The PDF '{}' is password-protected.", args.input.display())
-                }
-                AppError::Io(io_err) => anyhow::anyhow!("I/O error: {}", io_err),
-                other => anyhow::anyhow!("{}", other),
-            })?;
-
-            let metadata = std::fs::metadata(&args.input).with_context(|| {
-                format!("Cannot read file metadata for '{}'", args.input.display())
-            })?;
-
-            let page_count = doc.get_pages().len();
-            let file_size = metadata.len();
-
-            if args.json {
-                let info = serde_json::json!({
-                    "path": args.input.display().to_string(),
-                    "file_size_bytes": file_size,
-                    "page_count": page_count,
-                    "pdf_version": doc.version,
-                });
-                println!("{}", serde_json::to_string_pretty(&info)?);
-            } else {
-                let separator = "─".repeat(50);
-                println!("{}", separator.dimmed());
-                println!("{}", "PDF Information".bold());
-                println!("{}", separator.dimmed());
-                println!(
-                    "  {:<18} {}",
-                    "File:".dimmed(),
-                    args.input.display().to_string().cyan()
-                );
-                println!(
-                    "  {:<18} {}",
-                    "Size:".dimmed(),
-                    humansize::format_size(file_size, humansize::DECIMAL).white()
-                );
-                println!(
-                    "  {:<18} {}",
-                    "Pages:".dimmed(),
-                    page_count.to_string().white()
-                );
-                println!("  {:<18} {}", "PDF version:".dimmed(), doc.version.white());
-                println!("{}", separator.dimmed());
-            }
+fn main() -> ExitCode {
+    let cli = Cli::parse();
+    init_logging(cli.verbose, cli.quiet);
+    match run(cli.command) {
+        Ok(code) => code,
+        Err(error) => {
+            eprintln!("{} {}", "Error:".red().bold(), error);
+            ExitCode::from(error.exit_code())
         }
     }
-
-    Ok(())
 }
