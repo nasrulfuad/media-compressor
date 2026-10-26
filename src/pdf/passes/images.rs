@@ -5,6 +5,7 @@ use lopdf::{Dictionary, Document, Object, ObjectId, Stream};
 use tracing::{debug, warn};
 
 use crate::codec::jpeg::{encode_jpeg, JpegSettings, ScanMode};
+use crate::codec::png::encode_png_for_pdf_predictor;
 use crate::codec::zlib::deflate;
 use crate::domain::options::{ColorMode, ImageEncodingMode, PdfOptions};
 use crate::error::{AppError, AppResult};
@@ -23,6 +24,7 @@ const ORPHAN_BUDGET_SQUARE_INCHES: u64 = 4;
 const FLATE_IMAGE_DEFLATE_LEVEL: u32 = 9;
 const SUPPORTED_BITS_PER_COMPONENT: u8 = 8;
 const DEFAULT_BITS_PER_COMPONENT: u8 = 8;
+const PNG_OPTIMUM_PREDICTOR: i64 = 15;
 
 #[derive(Debug, Clone)]
 pub struct PageDimensions {
@@ -34,6 +36,7 @@ pub struct PageDimensions {
 enum ReencodedCodec {
     Jpeg,
     Flate,
+    FlateWithPngPredictor { colors: u8 },
 }
 
 struct ReencodedImage {
@@ -359,19 +362,44 @@ fn reencode_dct(
     }))
 }
 
-fn smaller_candidate(
-    jpeg: AppResult<ReencodedImage>,
-    flate: AppResult<ReencodedImage>,
-) -> AppResult<ReencodedImage> {
-    match (jpeg, flate) {
-        (Ok(jpeg), Ok(flate)) => Ok(if flate.bytes.len() < jpeg.bytes.len() {
-            flate
-        } else {
-            jpeg
-        }),
-        (Ok(candidate), Err(_)) | (Err(_), Ok(candidate)) => Ok(candidate),
-        (Err(error), Err(_)) => Err(error),
+fn smallest_candidate(candidates: Vec<AppResult<ReencodedImage>>) -> AppResult<ReencodedImage> {
+    let mut best: Option<ReencodedImage> = None;
+    let mut first_error: Option<AppError> = None;
+    for candidate in candidates {
+        match candidate {
+            Ok(image) => {
+                if best
+                    .as_ref()
+                    .map_or(true, |current| image.bytes.len() < current.bytes.len())
+                {
+                    best = Some(image);
+                }
+            }
+            Err(error) => {
+                first_error.get_or_insert(error);
+            }
+        }
     }
+    best.ok_or_else(|| {
+        first_error.unwrap_or_else(|| AppError::Encode("no image candidate".to_string()))
+    })
+}
+
+fn predictor_candidate(
+    image: &DynamicImage,
+    options: &PdfOptions,
+    describe: &dyn Fn(Vec<u8>, ReencodedCodec) -> ReencodedImage,
+) -> AppResult<ReencodedImage> {
+    let source = match options.color_mode {
+        ColorMode::Grayscale => DynamicImage::ImageLuma8(image.to_luma8()),
+        ColorMode::Preserve => DynamicImage::ImageRgb8(image.to_rgb8()),
+    };
+    let idat = encode_png_for_pdf_predictor(&source, options.level.preset().png_effort)?;
+    let colors = idat.colors();
+    Ok(describe(
+        idat.zlib_data,
+        ReencodedCodec::FlateWithPngPredictor { colors },
+    ))
 }
 
 fn reencode_raw(
@@ -405,12 +433,27 @@ fn reencode_raw(
     };
     let flate = encode_flate_pixels(&resized, options.color_mode)
         .map(|bytes| describe(bytes, ReencodedCodec::Flate));
-    if lossless {
-        return flate.map(Some);
+    let predictor = predictor_candidate(&resized, options, &describe);
+    let mut candidates = vec![flate, predictor];
+    if !lossless {
+        candidates.push(
+            encode_jpeg_candidate(&resized, quality, options.color_mode)
+                .map(|bytes| describe(bytes, ReencodedCodec::Jpeg)),
+        );
     }
-    let jpeg = encode_jpeg_candidate(&resized, quality, options.color_mode)
-        .map(|bytes| describe(bytes, ReencodedCodec::Jpeg));
-    smaller_candidate(jpeg, flate).map(Some)
+    smallest_candidate(candidates).map(Some)
+}
+
+fn predictor_parms(colors: u8, columns: u32) -> Dictionary {
+    let mut parms = Dictionary::new();
+    parms.set("Predictor", Object::Integer(PNG_OPTIMUM_PREDICTOR));
+    parms.set("Colors", Object::Integer(i64::from(colors)));
+    parms.set(
+        "BitsPerComponent",
+        Object::Integer(i64::from(SUPPORTED_BITS_PER_COMPONENT)),
+    );
+    parms.set("Columns", Object::Integer(i64::from(columns)));
+    parms
 }
 
 fn apply_reencoded(stream: &mut Stream, image: ReencodedImage) {
@@ -425,6 +468,13 @@ fn apply_reencoded(stream: &mut Stream, image: ReencodedImage) {
             stream.dict.remove(b"DecodeParms");
         }
         ReencodedCodec::Flate => replace_with_flate_bytes(stream, image.bytes),
+        ReencodedCodec::FlateWithPngPredictor { colors } => {
+            replace_with_flate_bytes(stream, image.bytes);
+            stream.dict.set(
+                "DecodeParms",
+                Object::Dictionary(predictor_parms(colors, image.width)),
+            );
+        }
     }
     let color_space: &[u8] = match image.color_mode {
         ColorMode::Grayscale => b"DeviceGray",
@@ -506,7 +556,7 @@ pub fn compress_images(
 mod tests {
     use super::*;
     use crate::domain::level::CompressionLevel;
-    use crate::test_support::{FixtureImage, PdfFixture};
+    use crate::test_support::{decoded_image_pixels, FixtureImage, PdfFixture};
 
     fn options(level: CompressionLevel) -> PdfOptions {
         PdfOptions::for_level(level)
@@ -670,7 +720,7 @@ mod tests {
         let (width, height) = image_dimensions(&after.dict).unwrap();
         assert!(width < 600 && height < 600, "{width}x{height}");
         let raw_length = match after.dict.get(b"Filter").unwrap().as_name().unwrap() {
-            b"FlateDecode" => decode_plain_stream(&after, usize::MAX).unwrap().len(),
+            b"FlateDecode" => decoded_image_pixels(&after).len(),
             _ => {
                 let decoded = image::load_from_memory(&after.content).unwrap();
                 assert_eq!((decoded.width(), decoded.height()), (width, height));
@@ -718,8 +768,7 @@ mod tests {
             after.dict.get(b"Filter").unwrap(),
             &Object::Name(b"FlateDecode".to_vec())
         );
-        let raw = decode_plain_stream(&after, usize::MAX).unwrap();
-        assert_eq!(raw.len(), 128 * 128 * 3);
+        assert_eq!(decoded_image_pixels(&after).len(), 128 * 128 * 3);
     }
 
     #[test]
@@ -936,5 +985,76 @@ mod tests {
     fn build_page_dpi_map_ignores_images_without_resources() {
         let document = PdfFixture::new().page_with_content(b"q Q").build();
         assert!(build_page_dpi_map(&document).is_empty());
+    }
+
+    fn lossless_result(width: u32, height: u32) -> (Vec<u8>, Stream) {
+        let mut document = photographic_document(width, height);
+        let mut settings = options(CompressionLevel::Medium);
+        settings.image_encoding = ImageEncodingMode::Lossless;
+        compress(&mut document, &settings);
+        (noisy_rgb_bytes(width, height), image_stream(&document).1)
+    }
+
+    #[test]
+    fn lossless_result_decodes_back_to_original_pixels_including_predictor_output() {
+        let (original, stream) = lossless_result(96, 96);
+        assert_eq!(decoded_image_pixels(&stream), original);
+    }
+
+    #[test]
+    fn images_pass_prefers_smallest_candidate() {
+        let (original, stream) = lossless_result(96, 96);
+        let plain_deflate = deflate(&original, 9).unwrap();
+        assert!(stream.content.len() <= plain_deflate.len());
+    }
+
+    #[test]
+    fn predictor_candidate_sets_png_decode_parms() {
+        let image = DynamicImage::ImageRgb8(image::RgbImage::from_fn(64, 64, |x, y| {
+            image::Rgb([(x * 4) as u8, (y * 4) as u8, ((x + y) * 2) as u8])
+        }));
+        let options = options(CompressionLevel::Medium);
+        let describe = |bytes: Vec<u8>, codec: ReencodedCodec| ReencodedImage {
+            bytes,
+            codec,
+            width: 64,
+            height: 64,
+            color_mode: ColorMode::Preserve,
+        };
+        let candidate = predictor_candidate(&image, &options, &describe).unwrap();
+        assert_eq!(
+            candidate.codec,
+            ReencodedCodec::FlateWithPngPredictor { colors: 3 }
+        );
+        let mut stream = Stream::new(Dictionary::new(), Vec::new());
+        apply_reencoded(&mut stream, candidate);
+        let parms = stream.dict.get(b"DecodeParms").unwrap().as_dict().unwrap();
+        assert_eq!(parms.get(b"Predictor").unwrap(), &Object::Integer(15));
+        assert_eq!(parms.get(b"Colors").unwrap(), &Object::Integer(3));
+        assert_eq!(parms.get(b"Columns").unwrap(), &Object::Integer(64));
+        assert_eq!(decoded_image_pixels(&stream).len(), 64 * 64 * 3);
+    }
+
+    #[test]
+    fn smallest_candidate_returns_smallest_and_first_error_when_all_fail() {
+        let make = |size: usize| {
+            Ok(ReencodedImage {
+                bytes: vec![0; size],
+                codec: ReencodedCodec::Flate,
+                width: 1,
+                height: 1,
+                color_mode: ColorMode::Preserve,
+            })
+        };
+        let best = smallest_candidate(vec![make(9), make(3), make(5)]).unwrap();
+        assert_eq!(best.bytes.len(), 3);
+        let failing = vec![
+            Err(AppError::Encode("first".into())),
+            Err(AppError::Encode("second".into())),
+        ];
+        assert!(
+            matches!(smallest_candidate(failing), Err(AppError::Encode(message)) if message == "first")
+        );
+        assert!(smallest_candidate(Vec::new()).is_err());
     }
 }

@@ -5,10 +5,12 @@ use std::time::Instant;
 use rayon::prelude::*;
 use tracing::{debug, info, warn};
 
+use crate::detection::{detect_media_type, MAGIC_BYTES_TO_READ};
 use crate::domain::options::{FailurePolicy, WriteMode};
 use crate::domain::report::{BatchContext, BatchReport, FileOutcome, FileResult};
 use crate::error::{AppError, AppResult};
 use crate::fs::discovery::{discover_files, DiscoveryRequest};
+use crate::fs::reader::read_leading_bytes;
 
 use super::compress_file::compress_file;
 use super::output_path::{batch_output_path, default_batch_output_dir};
@@ -17,7 +19,7 @@ use super::registry::CompressorRegistry;
 use super::{BatchRequest, CompressRequest};
 
 const SKIPPED_OUTPUT_EXISTS: &str = "output already exists";
-const SKIPPED_AFTER_FAILURE: &str = "not processed: an earlier file failed";
+const SKIPPED_AFTER_FAILURE: &str = "aborted after an earlier failure";
 
 struct BatchJob<'a> {
     request: &'a BatchRequest,
@@ -45,11 +47,19 @@ fn failed(path: &Path, error: &AppError) -> FileResult {
     }
 }
 
+fn planned_output_path(job: &BatchJob<'_>, file: &Path) -> AppResult<PathBuf> {
+    let leading = read_leading_bytes(file, MAGIC_BYTES_TO_READ)?;
+    let media_type = detect_media_type(&leading);
+    let compressor = job.registry.find(&media_type)?;
+    let extension = compressor.output_extension(file, &media_type, &job.request.settings);
+    batch_output_path(file, job.input_dir, job.output_dir, Some(&extension))
+}
+
 fn process_file(job: &BatchJob<'_>, file: &Path) -> FileResult {
     if job.stop_requested.load(Ordering::SeqCst) {
         return skipped(file, SKIPPED_AFTER_FAILURE);
     }
-    let output = match batch_output_path(file, job.input_dir, job.output_dir, None) {
+    let output = match planned_output_path(job, file) {
         Ok(output) => output,
         Err(error) => return record_failure(job, file, &error),
     };
@@ -288,6 +298,39 @@ mod tests {
         assert_eq!(report.failed, 1);
         assert_eq!(report.skipped, 3);
         assert_eq!(report.succeeded, 0);
+    }
+
+    #[test]
+    fn process_batch_converts_extension_when_output_format_changes() {
+        let (_dir, input, output) = setup();
+        std::fs::write(input.join("b.png"), png_bytes()).unwrap();
+        let mut request = batch_request(&input, &output);
+        request.settings.image.output_format = crate::domain::media::OutputFormat::Jpeg;
+        let report = run(&request).unwrap();
+        assert_eq!(report.succeeded, 1);
+        assert!(output.join("b.jpg").exists());
+        assert!(!output.join("b.png").exists());
+    }
+
+    #[test]
+    fn process_batch_keeps_input_extension_spelling_without_conversion() {
+        let (_dir, input, output) = setup();
+        std::fs::write(
+            input.join("photo.JPEG"),
+            encode_as(&gradient_rgb(32, 32), image::ImageFormat::Jpeg),
+        )
+        .unwrap();
+        let report = run(&batch_request(&input, &output)).unwrap();
+        assert_eq!(report.succeeded, 1);
+        assert!(output.join("photo.JPEG").exists());
+    }
+
+    #[test]
+    fn process_batch_reports_unsupported_gif_as_failure() {
+        let (_dir, input, output) = setup();
+        std::fs::write(input.join("anim.png"), b"GIF89a\x01\x00\x01\x00").unwrap();
+        let report = run(&batch_request(&input, &output)).unwrap();
+        assert_eq!(report.failed, 1);
     }
 
     #[test]

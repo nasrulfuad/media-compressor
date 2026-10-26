@@ -123,8 +123,8 @@ impl PdfPass for FontsPass {
         options.fonts == FontOptimization::Subset
     }
 
-    fn run(&self, document: &mut Document, _options: &PdfOptions) -> AppResult<i64> {
-        Ok(subset_fonts(document)? as i64)
+    fn run(&self, document: &mut Document, options: &PdfOptions) -> AppResult<i64> {
+        subset_fonts(document, options)
     }
 }
 

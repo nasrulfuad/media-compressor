@@ -497,6 +497,48 @@ impl PdfFixture {
         self
     }
 
+    pub fn with_identity_cid_font(mut self, font_program: &[u8]) -> Self {
+        let font_file = flate_stream(
+            dictionary! { "Length1" => font_program.len() as i64 },
+            font_program,
+        );
+        let font_file_id = self.document.add_object(font_file);
+        let descriptor_id = self.document.add_object(dictionary! {
+            "Type" => "FontDescriptor",
+            "FontName" => "TestFont",
+            "Flags" => 4,
+            "FontBBox" => vec![Object::Integer(-200), Object::Integer(-300), Object::Integer(1200), Object::Integer(1000)],
+            "ItalicAngle" => 0,
+            "Ascent" => 900,
+            "Descent" => -200,
+            "CapHeight" => 700,
+            "StemV" => 80,
+            "FontFile2" => font_file_id,
+        });
+        let descendant_id = self.document.add_object(dictionary! {
+            "Type" => "Font",
+            "Subtype" => "CIDFontType2",
+            "BaseFont" => "TestFont",
+            "CIDToGIDMap" => "Identity",
+            "CIDSystemInfo" => dictionary! {
+                "Registry" => Object::string_literal("Adobe"),
+                "Ordering" => Object::string_literal("Identity"),
+                "Supplement" => 0,
+            },
+            "DW" => 1000,
+            "FontDescriptor" => descriptor_id,
+        });
+        let type0_id = self.document.add_object(dictionary! {
+            "Type" => "Font",
+            "Subtype" => "Type0",
+            "BaseFont" => "TestFont",
+            "Encoding" => "Identity-H",
+            "DescendantFonts" => vec![Object::Reference(descendant_id)],
+        });
+        self.register_page_resource("Font", FIXTURE_FONT_NAME, Object::Reference(type0_id));
+        self
+    }
+
     pub fn build(self) -> Document {
         self.document
     }
@@ -545,6 +587,79 @@ pub fn assert_no_dangling_references(document: &Document) {
         .filter(|id| !document.objects.contains_key(id))
         .collect();
     assert!(missing.is_empty(), "dangling references: {missing:?}");
+}
+
+fn paeth_predictor(left: u8, up: u8, up_left: u8) -> u8 {
+    let (a, b, c) = (i32::from(left), i32::from(up), i32::from(up_left));
+    let estimate = a + b - c;
+    let (distance_a, distance_b, distance_c) = (
+        (estimate - a).abs(),
+        (estimate - b).abs(),
+        (estimate - c).abs(),
+    );
+    if distance_a <= distance_b && distance_a <= distance_c {
+        left
+    } else if distance_b <= distance_c {
+        up
+    } else {
+        up_left
+    }
+}
+
+fn unfilter_png_rows(filtered: &[u8], columns: usize, colors: usize) -> Vec<u8> {
+    let row_bytes = columns * colors;
+    let mut output: Vec<u8> = Vec::with_capacity(filtered.len());
+    for (row_index, row) in filtered.chunks(row_bytes + 1).enumerate() {
+        let (filter, data) = (row[0], &row[1..]);
+        let previous_start = output.len().saturating_sub(row_bytes);
+        for (index, byte) in data.iter().enumerate() {
+            let left = if index >= colors {
+                output[output.len() - colors]
+            } else {
+                0
+            };
+            let up = if row_index > 0 {
+                output[previous_start + index]
+            } else {
+                0
+            };
+            let up_left = if row_index > 0 && index >= colors {
+                output[previous_start + index - colors]
+            } else {
+                0
+            };
+            let predicted = match filter {
+                0 => 0,
+                1 => left,
+                2 => up,
+                3 => ((u16::from(left) + u16::from(up)) / 2) as u8,
+                _ => paeth_predictor(left, up, up_left),
+            };
+            output.push(byte.wrapping_add(predicted));
+        }
+    }
+    output
+}
+
+pub fn decoded_image_pixels(stream: &Stream) -> Vec<u8> {
+    let inflated = crate::codec::zlib::inflate_bounded(&stream.content, usize::MAX)
+        .expect("image stream must inflate");
+    let parms = match stream.dict.get(b"DecodeParms") {
+        Ok(Object::Dictionary(parms)) => parms,
+        _ => return inflated,
+    };
+    let number = |key: &[u8]| {
+        parms
+            .get(key)
+            .ok()
+            .and_then(|v| v.as_i64().ok())
+            .unwrap_or(1)
+    };
+    unfilter_png_rows(
+        &inflated,
+        number(b"Columns") as usize,
+        number(b"Colors") as usize,
+    )
 }
 
 pub fn decoded_page_content(document: &Document, page_number: u32) -> Vec<u8> {

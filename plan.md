@@ -4,10 +4,7 @@ Goal: apply clean architecture, full unit test coverage, no comments in Rust sou
 
 This plan is written for an executor model. Follow it literally. When something in the codebase contradicts the plan, or a step cannot be done as written, **stop and ask the user**. Do not improvise a different design.
 
-Status: **P0–P3 implemented** on branch `refactor/clean-architecture` (working tree, no commits yet).
-
-Pulled forward from later phases because P1 reshaped the same code: pure byte-in/byte-out engines (P6.1/P6.2), `PdfPass` pipeline and never-bigger guard, accurate dry-run, alpha-preserving PNG path, flatten-onto-white for JPEG output, CLI quality/lossless/grayscale wiring (N1–N3), fail-fast batch with local rayon pool (C11), typed errors and thin `main`, bounded decompression and pixel limits, `read_bounded`, `write_atomically`, symlink-safe discovery. Still open: P4 (font subsetting keeps the old unsafe implementation behind `--compress-fonts`), `--max-input-size` flag, P7 (comments remain in `cli/args.rs`, `pdf/passes/fonts.rs`, `tests/integration_test.rs`), P8 (integration test split, coverage gate, CLAUDE.md/README updates).
-Extra findings fixed along the way: stale `/Width` `/Height` after PDF image downsampling, `default_output_path` dropping dotted stems, `lopdf::Document::get_page_resources` not inheriting direct resource dictionaries.
+Status: **P0–P6 implemented** on branch `refactor/clean-architecture`. P4 (identity CID font subsetting with usage walker, CIDToGIDMap rebuild, subset tags), P5 (bounded decode, `--max-input-size`, symlink-safe discovery, atomic writes, batch failure tests) and P6 (pure engines, batch CLI parity, extension from resolved format, NoProgress for `--json`/`--quiet`, PNG predictor 15 for Flate images, `anyhow` removed) are done. CLI help already lives in `#[arg(help = ...)]` attributes (part of P7.1). Open: P7 (comments left in `tests/integration_test.rs`, `summary.md` translation, readability sweep, `no-comments` in `make check`) and P8 (integration test split, coverage gate, `CLAUDE.md`/README updates). The D9 font test is `#[ignore]` until `tests/fixtures/fonts/test-font.ttf` exists; it passed locally with a temporary system font.
 
 ---
 

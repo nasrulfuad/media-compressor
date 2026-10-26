@@ -54,7 +54,7 @@ fn compress_subcommand_help_exits_successfully() {
         .args(["compress", "--help"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("Compress any supported file"));
+        .stdout(predicate::str::contains("--max-input-size"));
 }
 
 #[test]

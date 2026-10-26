@@ -5,14 +5,7 @@ use crate::domain::options::{
     PdfOptions, WriteMode,
 };
 
-use super::args::{BatchArgs, CompressArgs};
-
-struct SharedFlags {
-    grayscale: bool,
-    lossless: bool,
-    keep_metadata: bool,
-    compress_fonts: bool,
-}
+use super::args::{BatchArgs, CompressArgs, MediaOptionsArgs};
 
 fn write_mode(dry_run: bool, overwrite: bool) -> WriteMode {
     if dry_run {
@@ -24,58 +17,58 @@ fn write_mode(dry_run: bool, overwrite: bool) -> WriteMode {
     }
 }
 
-fn apply_flags(settings: &mut CompressionSettings, flags: &SharedFlags) {
-    if flags.grayscale {
+fn apply_flags(settings: &mut CompressionSettings, options: &MediaOptionsArgs) {
+    if options.grayscale {
         settings.pdf.color_mode = ColorMode::Grayscale;
         settings.image.color_mode = ColorMode::Grayscale;
     }
-    if flags.lossless {
+    if options.lossless {
         settings.pdf.image_encoding = ImageEncodingMode::Lossless;
         settings.image.encoding = ImageEncodingMode::Lossless;
     }
-    if flags.keep_metadata {
+    if options.keep_metadata {
         settings.pdf.metadata = MetadataPolicy::Keep;
         settings.image.metadata = MetadataPolicy::Keep;
     }
-    if flags.compress_fonts {
+    if options.compress_fonts {
         settings.pdf.fonts = FontOptimization::Subset;
     }
 }
 
-fn base_settings(level: CompressionLevel, flags: &SharedFlags) -> CompressionSettings {
+fn apply_overrides(settings: &mut CompressionSettings, options: &MediaOptionsArgs) {
+    if let Some(quality) = options.quality {
+        settings.pdf.jpeg_quality = quality;
+        settings.image.quality = quality;
+    }
+    if let Some(quality) = options.image_quality {
+        settings.pdf.jpeg_quality = quality;
+    }
+    if let Some(dpi) = options.dpi {
+        settings.pdf.target_dpi = Some(dpi);
+    }
+    settings.image.output_format = options.format.into();
+    settings.image.max_dimension = options.max_dimension;
+    settings.pdf.limits.max_input_bytes = options.max_input_size;
+    settings.image.limits.max_input_bytes = options.max_input_size;
+}
+
+fn settings_from(options: &MediaOptionsArgs) -> CompressionSettings {
+    let level: CompressionLevel = options.level.into();
     let mut settings = CompressionSettings {
         pdf: PdfOptions::for_level(level),
         image: ImageOptions::for_level(level),
     };
-    apply_flags(&mut settings, flags);
+    apply_flags(&mut settings, options);
+    apply_overrides(&mut settings, options);
     settings
 }
 
 impl From<CompressArgs> for CompressRequest {
     fn from(args: CompressArgs) -> Self {
-        let flags = SharedFlags {
-            grayscale: args.grayscale,
-            lossless: args.lossless,
-            keep_metadata: args.keep_metadata,
-            compress_fonts: args.compress_fonts,
-        };
-        let mut settings = base_settings(args.level.into(), &flags);
-        if let Some(quality) = args.quality {
-            settings.pdf.jpeg_quality = quality;
-            settings.image.quality = quality;
-        }
-        if let Some(quality) = args.image_quality {
-            settings.pdf.jpeg_quality = quality;
-        }
-        if let Some(dpi) = args.dpi {
-            settings.pdf.target_dpi = Some(dpi);
-        }
-        settings.image.output_format = args.format.into();
-        settings.image.max_dimension = args.max_dimension;
         CompressRequest {
             input: args.input,
             output: args.output,
-            settings,
+            settings: settings_from(&args.options),
             write_mode: write_mode(args.dry_run, args.overwrite),
         }
     }
@@ -91,20 +84,6 @@ fn failure_policy(continue_on_error: bool) -> FailurePolicy {
 
 impl From<BatchArgs> for BatchRequest {
     fn from(args: BatchArgs) -> Self {
-        let flags = SharedFlags {
-            grayscale: false,
-            lossless: false,
-            keep_metadata: args.keep_metadata,
-            compress_fonts: args.compress_fonts,
-        };
-        let mut settings = base_settings(args.level.into(), &flags);
-        if let Some(quality) = args.image_quality {
-            settings.pdf.jpeg_quality = quality;
-            settings.image.quality = quality;
-        }
-        if let Some(dpi) = args.dpi {
-            settings.pdf.target_dpi = Some(dpi);
-        }
         BatchRequest {
             input_dir: args.input_dir,
             output_dir: args.output_dir,
@@ -112,7 +91,7 @@ impl From<BatchArgs> for BatchRequest {
             recursive: args.recursive,
             workers: args.workers,
             failure_policy: failure_policy(args.continue_on_error),
-            settings,
+            settings: settings_from(&args.options),
             write_mode: write_mode(args.dry_run, args.overwrite),
         }
     }
@@ -273,8 +252,39 @@ mod tests {
             "--keep-metadata",
         ]);
         assert_eq!(request.settings.pdf.jpeg_quality, 42);
-        assert_eq!(request.settings.image.quality, 42);
+        assert_eq!(request.settings.image.quality, 75);
         assert_eq!(request.settings.pdf.target_dpi, Some(110));
         assert_eq!(request.settings.pdf.metadata, MetadataPolicy::Keep);
+    }
+
+    #[test]
+    fn compress_args_map_max_input_size_to_both_engines() {
+        let request = compress_request(&["in.pdf", "--max-input-size", "123"]);
+        assert_eq!(request.settings.pdf.limits.max_input_bytes, 123);
+        assert_eq!(request.settings.image.limits.max_input_bytes, 123);
+    }
+
+    #[test]
+    fn batch_args_map_image_options_like_compress() {
+        let request = batch_request(&[
+            "dir",
+            "--quality",
+            "50",
+            "-f",
+            "png",
+            "--max-dimension",
+            "640",
+            "--grayscale",
+            "--lossless",
+            "--max-input-size",
+            "77",
+        ]);
+        assert_eq!(request.settings.image.quality, 50);
+        assert_eq!(request.settings.pdf.jpeg_quality, 50);
+        assert_eq!(request.settings.image.output_format, OutputFormat::Png);
+        assert_eq!(request.settings.image.max_dimension, Some(640));
+        assert_eq!(request.settings.pdf.color_mode, ColorMode::Grayscale);
+        assert_eq!(request.settings.image.encoding, ImageEncodingMode::Lossless);
+        assert_eq!(request.settings.pdf.limits.max_input_bytes, 77);
     }
 }

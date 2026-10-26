@@ -34,6 +34,13 @@ pub fn read_bounded(path: &Path, max_bytes: u64) -> AppResult<Vec<u8>> {
     Ok(bytes)
 }
 
+pub fn read_leading_bytes(path: &Path, count: usize) -> AppResult<Vec<u8>> {
+    let file = open_input(path)?;
+    let mut bytes = Vec::with_capacity(count);
+    file.take(count as u64).read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
 #[cfg(test)]
 mod tests {
     use std::io::Write;
@@ -85,5 +92,23 @@ mod tests {
         let directory = tempfile::TempDir::new().unwrap();
         let error = read_bounded(directory.path(), 1_000_000).unwrap_err();
         assert!(matches!(error, AppError::Io(_)));
+    }
+
+    #[test]
+    fn read_leading_bytes_returns_prefix_of_file() {
+        let file = temp_file_with(b"0123456789");
+        assert_eq!(read_leading_bytes(file.path(), 4).unwrap(), b"0123");
+    }
+
+    #[test]
+    fn read_leading_bytes_returns_whole_short_file() {
+        let file = temp_file_with(b"ab");
+        assert_eq!(read_leading_bytes(file.path(), 16).unwrap(), b"ab");
+    }
+
+    #[test]
+    fn read_leading_bytes_reports_missing_file() {
+        let error = read_leading_bytes(Path::new("/nonexistent/x"), 4).unwrap_err();
+        assert!(matches!(error, AppError::InputNotFound(_)));
     }
 }

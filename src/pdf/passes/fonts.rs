@@ -1,600 +1,531 @@
-//! Font subsetting for embedded PDF fonts.
-//!
-//! ## Subsetting
-//!
-//! For TrueType / OpenType fonts (FontFile2 / FontFile3 with CFF), the
-//! `subsetter` crate is used to strip unused glyphs.  Used glyph IDs are
-//! collected by **parsing all page content streams** (tracking `Tf`, `Tj`,
-//! `TJ`, `'`, `"` operators) to find exactly which character codes each font
-//! actually renders.  This is far more reliable than the old approach of
-//! inferring glyph usage from `/W` or `/Widths` arrays, which miss glyphs
-//! that use the default width (`/DW`).
-//!
-//! Only fonts with an embedded font file are processed; Standard 14 fonts are
-//! skipped.
+use std::collections::hash_map::DefaultHasher;
+use std::collections::{BTreeSet, HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 
-use std::collections::{HashMap, HashSet};
+use lopdf::{Dictionary, Document, Object, ObjectId, Stream};
+use subsetter::GlyphRemapper;
+use tracing::{debug, warn};
 
-use lopdf::content::Operation;
-use lopdf::{Document, Object, ObjectId};
-use tracing::{debug, info};
-
+use crate::codec::zlib::deflate;
+use crate::domain::options::PdfOptions;
 use crate::error::AppResult;
+use crate::pdf::filters::{decode_plain_stream, replace_with_flate_bytes};
+use crate::pdf::font_usage::collect_font_usage;
+use crate::pdf::object_graph::{catalog_id, dict_name_is, resolve_array, resolve_dict};
 
-// Keys used to locate the embedded font file stream inside a FontDescriptor.
-const FONT_FILE_KEYS: &[&[u8]] = &[b"FontFile", b"FontFile2", b"FontFile3"];
+const SUBSET_TAG_LENGTH: usize = 6;
+const ALPHABET_SIZE: u64 = 26;
+const CID_MAP_ENTRY_BYTES: usize = 2;
+const NOTDEF_GLYPH: u16 = 0;
+const IDENTITY_ENCODINGS: [&[u8]; 2] = [b"Identity-H", b"Identity-V"];
 
-// ── Font Subsetting ──────────────────────────────────────────────────────────
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FontTarget {
+    pub type0_id: ObjectId,
+    pub descendant_id: ObjectId,
+    pub descriptor_id: ObjectId,
+    pub font_file_id: ObjectId,
+}
 
-/// Subset all embedded TrueType/OpenType fonts so only used glyphs remain.
-///
-/// For each font with an embedded font file (`/FontFile2` for TrueType,
-/// `/FontFile3` for CFF/OpenType), the module:
-///
-/// 1. Parses all page content streams to find exactly which character codes
-///    each font renders (via `Tf`, `Tj`, `TJ`, `'`, `"` operators).
-/// 2. Maps character codes to glyph IDs (CID = glyph ID for Identity mapping;
-///    char code ≈ glyph ID for simple fonts).
-/// 3. Runs the `subsetter` crate to produce a minimal font containing only
-///    those glyphs (plus `.notdef`).
-/// 4. Replaces the embedded font file stream with the smaller version.
-///
-/// Returns the total bytes saved.  Fonts that are already subsetted (name
-/// contains '+' prefix like `ABCDEF+Arial`) are skipped.
-pub fn subset_fonts(doc: &mut Document) -> AppResult<u64> {
-    // ── Phase 0: Parse all content streams to find used chars per font ────
-    let used_chars = collect_used_chars_from_content_streams(doc);
-    debug!(
-        fonts_with_text = used_chars.len(),
-        "Content stream character collection complete"
-    );
+pub fn is_subset_tagged(name: &[u8]) -> bool {
+    name.len() > SUBSET_TAG_LENGTH
+        && name[SUBSET_TAG_LENGTH] == b'+'
+        && name[..SUBSET_TAG_LENGTH].iter().all(u8::is_ascii_uppercase)
+}
 
-    let all_ids: Vec<ObjectId> = doc.objects.keys().copied().collect();
-    let mut total_saved: u64 = 0;
+pub fn subset_tag(glyphs: &[u16]) -> String {
+    let mut hasher = DefaultHasher::new();
+    glyphs.hash(&mut hasher);
+    let mut value = hasher.finish();
+    (0..SUBSET_TAG_LENGTH)
+        .map(|_| {
+            let letter = b'A' + (value % ALPHABET_SIZE) as u8;
+            value /= ALPHABET_SIZE;
+            letter as char
+        })
+        .collect()
+}
 
-    for id in &all_ids {
-        // Look for /Font objects.
-        let (base_font, descriptor_id, font_subtype) = {
-            let obj = match doc.objects.get(id) {
-                Some(o) => o,
-                None => continue,
-            };
-            let dict = match obj {
-                Object::Dictionary(d) => d,
-                _ => continue,
-            };
-            let is_font = matches!(
-                dict.get(b"Type"),
-                Ok(Object::Name(n)) if n == b"Font"
-            );
-            if !is_font {
+pub fn build_cid_to_gid_map(glyphs: &[u16], remapper: &GlyphRemapper) -> Vec<u8> {
+    let max_cid = glyphs.iter().copied().max().unwrap_or(NOTDEF_GLYPH);
+    let mut map = vec![0u8; (usize::from(max_cid) + 1) * CID_MAP_ENTRY_BYTES];
+    for cid in glyphs {
+        let new_gid = remapper.get(*cid).unwrap_or(NOTDEF_GLYPH);
+        let offset = usize::from(*cid) * CID_MAP_ENTRY_BYTES;
+        map[offset..offset + CID_MAP_ENTRY_BYTES].copy_from_slice(&new_gid.to_be_bytes());
+    }
+    map
+}
+
+fn acroform_default_font_ids(document: &Document) -> HashSet<ObjectId> {
+    let Some(catalog) = catalog_id(document).and_then(|id| document.get_dictionary(id).ok()) else {
+        return HashSet::new();
+    };
+    let fonts = catalog
+        .get(b"AcroForm")
+        .ok()
+        .and_then(|form| resolve_dict(document, form))
+        .and_then(|form| form.get(b"DR").ok())
+        .and_then(|resources| resolve_dict(document, resources))
+        .and_then(|resources| resources.get(b"Font").ok())
+        .and_then(|fonts| resolve_dict(document, fonts));
+    fonts
+        .map(|dict| {
+            dict.iter()
+                .filter_map(|(_, value)| value.as_reference().ok())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn name_bytes<'a>(dict: &'a Dictionary, key: &[u8]) -> Option<&'a [u8]> {
+    dict.get(key).ok().and_then(|value| value.as_name().ok())
+}
+
+fn single_descendant(document: &Document, type0: &Dictionary) -> Option<ObjectId> {
+    let descendants = type0
+        .get(b"DescendantFonts")
+        .ok()
+        .and_then(|value| resolve_array(document, value))?;
+    match descendants.as_slice() {
+        [Object::Reference(id)] => Some(*id),
+        _ => None,
+    }
+}
+
+fn has_identity_cid_map(descendant: &Dictionary) -> bool {
+    match descendant.get(b"CIDToGIDMap") {
+        Err(_) => true,
+        Ok(value) => matches!(value, Object::Name(name) if name == b"Identity"),
+    }
+}
+
+fn font_file_target(
+    document: &Document,
+    type0_id: ObjectId,
+    descendant_id: ObjectId,
+) -> Option<FontTarget> {
+    let descendant = document.get_dictionary(descendant_id).ok()?;
+    if !dict_name_is(descendant, b"Subtype", b"CIDFontType2") || !has_identity_cid_map(descendant) {
+        return None;
+    }
+    let descriptor_id = descendant
+        .get(b"FontDescriptor")
+        .ok()?
+        .as_reference()
+        .ok()?;
+    let descriptor = document.get_dictionary(descriptor_id).ok()?;
+    let font_file_id = descriptor.get(b"FontFile2").ok()?.as_reference().ok()?;
+    matches!(document.objects.get(&font_file_id), Some(Object::Stream(_))).then_some(FontTarget {
+        type0_id,
+        descendant_id,
+        descriptor_id,
+        font_file_id,
+    })
+}
+
+pub fn eligible_target(
+    document: &Document,
+    type0_id: ObjectId,
+    excluded: &HashSet<ObjectId>,
+) -> Option<FontTarget> {
+    let type0 = document.get_dictionary(type0_id).ok()?;
+    if !dict_name_is(type0, b"Subtype", b"Type0") || excluded.contains(&type0_id) {
+        return None;
+    }
+    let encoding = name_bytes(type0, b"Encoding")?;
+    if !IDENTITY_ENCODINGS.contains(&encoding) {
+        return None;
+    }
+    if name_bytes(type0, b"BaseFont").is_some_and(is_subset_tagged) {
+        return None;
+    }
+    let descendant_id = single_descendant(document, type0)?;
+    font_file_target(document, type0_id, descendant_id)
+}
+
+fn find_targets(document: &Document) -> Vec<FontTarget> {
+    let excluded = acroform_default_font_ids(document);
+    let targets: Vec<FontTarget> = document
+        .objects
+        .keys()
+        .filter_map(|id| eligible_target(document, *id, &excluded))
+        .collect();
+    let mut file_counts: HashMap<ObjectId, usize> = HashMap::new();
+    for target in &targets {
+        *file_counts.entry(target.font_file_id).or_insert(0) += 1;
+    }
+    targets
+        .into_iter()
+        .filter(|target| {
+            let unique = file_counts.get(&target.font_file_id) == Some(&1);
+            if !unique {
+                debug!(font = ?target.type0_id, reason = "font program shared", "Font subsetting skipped");
+            }
+            unique
+        })
+        .collect()
+}
+
+struct SubsetPlan {
+    subset_program: Vec<u8>,
+    stored_program: Vec<u8>,
+    cid_map_stored: Vec<u8>,
+    tag: String,
+    old_stored_size: usize,
+}
+
+fn glyphs_to_keep(used: &BTreeSet<u16>) -> Vec<u16> {
+    let mut glyphs: BTreeSet<u16> = used.clone();
+    glyphs.insert(NOTDEF_GLYPH);
+    glyphs.into_iter().collect()
+}
+
+fn plan_subset(
+    document: &Document,
+    target: &FontTarget,
+    used: &BTreeSet<u16>,
+    options: &PdfOptions,
+) -> AppResult<Option<SubsetPlan>> {
+    let Some(Object::Stream(font_file)) = document.objects.get(&target.font_file_id) else {
+        return Ok(None);
+    };
+    let program = decode_plain_stream(font_file, options.limits.max_stream_bytes)?;
+    let glyphs = glyphs_to_keep(used);
+    let remapper = GlyphRemapper::new_from_glyphs_sorted(&glyphs);
+    let subset_program = match subsetter::subset(&program, 0, &remapper) {
+        Ok(subset) => subset,
+        Err(error) => {
+            warn!(font = ?target.type0_id, error = %error, "Font subsetting failed; font left untouched");
+            return Ok(None);
+        }
+    };
+    let level = options.level.preset().deflate_level;
+    let stored_program = deflate(&subset_program, level)?;
+    let cid_map_stored = deflate(&build_cid_to_gid_map(&glyphs, &remapper), level)?;
+    let plan = SubsetPlan {
+        subset_program,
+        stored_program,
+        cid_map_stored,
+        tag: subset_tag(&glyphs),
+        old_stored_size: font_file.content.len(),
+    };
+    let new_size = plan.stored_program.len() + plan.cid_map_stored.len();
+    Ok((new_size < plan.old_stored_size).then_some(plan))
+}
+
+fn tagged_name(tag: &str, original: &[u8]) -> Object {
+    let mut name = format!("{tag}+").into_bytes();
+    name.extend_from_slice(original);
+    Object::Name(name)
+}
+
+fn apply_tag(document: &mut Document, id: ObjectId, key: &[u8], tag: &str) {
+    let Ok(dict) = document.get_dictionary_mut(id) else {
+        return;
+    };
+    let Some(original) = name_bytes(dict, key).map(<[u8]>::to_vec) else {
+        return;
+    };
+    if !is_subset_tagged(&original) {
+        dict.set(key.to_vec(), tagged_name(tag, &original));
+    }
+}
+
+fn apply_plan(document: &mut Document, target: &FontTarget, plan: SubsetPlan) {
+    if let Some(Object::Stream(font_file)) = document.objects.get_mut(&target.font_file_id) {
+        replace_with_flate_bytes(font_file, plan.stored_program);
+        font_file
+            .dict
+            .set("Length1", Object::Integer(plan.subset_program.len() as i64));
+    }
+    let mut cid_map = Stream::new(Dictionary::new(), Vec::new());
+    replace_with_flate_bytes(&mut cid_map, plan.cid_map_stored);
+    let cid_map_id = document.add_object(Object::Stream(cid_map));
+    if let Ok(descendant) = document.get_dictionary_mut(target.descendant_id) {
+        descendant.set("CIDToGIDMap", Object::Reference(cid_map_id));
+    }
+    apply_tag(document, target.type0_id, b"BaseFont", &plan.tag);
+    apply_tag(document, target.descendant_id, b"BaseFont", &plan.tag);
+    apply_tag(document, target.descriptor_id, b"FontName", &plan.tag);
+}
+
+pub fn subset_fonts(document: &mut Document, options: &PdfOptions) -> AppResult<i64> {
+    let usage = collect_font_usage(document);
+    if !usage.is_complete {
+        warn!(
+            "Font usage could not be determined for every content stream; font subsetting skipped"
+        );
+        return Ok(0);
+    }
+    let mut total_saved = 0i64;
+    for target in find_targets(document) {
+        let Some(used) = usage.cids_by_font.get(&target.type0_id) else {
+            debug!(font = ?target.type0_id, reason = "no recorded usage", "Font subsetting skipped");
+            continue;
+        };
+        let plan = match plan_subset(document, &target, used, options) {
+            Ok(Some(plan)) => plan,
+            Ok(None) => continue,
+            Err(error) => {
+                warn!(font = ?target.type0_id, error = %error, "Font subsetting skipped");
                 continue;
             }
-            let base_font: Vec<u8> = match dict.get(b"BaseFont") {
-                Ok(Object::Name(n)) => n.clone(),
-                _ => continue,
-            };
-            let descriptor_id: ObjectId = match dict.get(b"FontDescriptor") {
-                Ok(Object::Reference(r)) => *r,
-                _ => continue,
-            };
-            let subtype: Vec<u8> = match dict.get(b"Subtype") {
-                Ok(Object::Name(n)) => n.clone(),
-                _ => continue,
-            };
-            (base_font, descriptor_id, subtype)
         };
-
-        // Skip already-subsetted fonts (e.g. "ABCDEF+Arial").
-        let base_font_str = String::from_utf8_lossy(&base_font);
-        if is_already_subsetted(&base_font_str) {
-            debug!(font = %base_font_str, "Font already subsetted, skipping");
-            continue;
-        }
-
-        // Find the embedded font file stream.
-        let (font_file_key, font_file_id) = match find_font_file(doc, descriptor_id) {
-            Some(f) => f,
-            None => continue,
-        };
-
-        // Only handle FontFile2 (TrueType) and FontFile3 (CFF/OpenType).
-        if font_file_key == b"FontFile" {
-            debug!(font = %base_font_str, "Type1 FontFile — subsetter cannot handle, skipping");
-            continue;
-        }
-
-        // For CIDFont (Type0), verify CIDToGIDMap is Identity — otherwise we
-        // cannot reliably map character codes to glyph IDs.
-        if font_subtype == b"Type0" && !has_identity_cid_to_gid_map(doc, *id) {
-            debug!(
-                font = %base_font_str,
-                "CIDToGIDMap is not Identity, skipping subsetting"
-            );
-            continue;
-        }
-
-        // Use content-stream-derived character codes.
-        let glyph_ids = match used_chars.get(id) {
-            Some(chars) if !chars.is_empty() => {
-                let mut glyphs = chars.clone();
-                glyphs.insert(0); // always include .notdef
-                glyphs
-            }
-            _ => {
-                debug!(
-                    font = %base_font_str,
-                    "Font not referenced in content streams, skipping subsetting"
-                );
-                continue;
-            }
-        };
-
-        // Get the font file data.
-        let original_data = match doc.objects.get(&font_file_id) {
-            Some(Object::Stream(s)) => s.content.clone(),
-            _ => continue,
-        };
-        let original_size = original_data.len();
-
-        // Run subsetter.
-        let glyph_vec: Vec<u16> = glyph_ids.into_iter().collect();
-        let mapper = subsetter::GlyphRemapper::new_from_glyphs(&glyph_vec);
-
-        match subsetter::subset(&original_data, 0, &mapper) {
-            Ok(subsetted) => {
-                if subsetted.len() < original_size {
-                    let saved = original_size - subsetted.len();
-                    debug!(
-                        font = %base_font_str,
-                        original_bytes = original_size,
-                        subsetted_bytes = subsetted.len(),
-                        glyph_count = glyph_vec.len(),
-                        saved,
-                        "Font subsetted successfully"
-                    );
-
-                    // Replace the font file stream content.
-                    if let Some(Object::Stream(s)) = doc.objects.get_mut(&font_file_id) {
-                        s.content = subsetted;
-                        s.dict
-                            .set("Length", Object::Integer(s.content.len() as i64));
-                        // Remove Length1/Length2/Length3 if present — they refer to
-                        // the old uncompressed/compressed lengths.
-                        s.dict.remove(b"Length1");
-                        s.dict.remove(b"Length2");
-                        s.dict.remove(b"Length3");
-                    }
-                    total_saved += saved as u64;
-                } else {
-                    debug!(
-                        font = %base_font_str,
-                        "Subsetted font not smaller, keeping original"
-                    );
-                }
-            }
-            Err(e) => {
-                debug!(
-                    font = %base_font_str,
-                    error = %e,
-                    "Subsetter failed, keeping original font"
-                );
-            }
-        }
+        total_saved += plan.old_stored_size as i64
+            - (plan.stored_program.len() + plan.cid_map_stored.len()) as i64;
+        apply_plan(document, &target, plan);
     }
-
-    if total_saved > 0 {
-        info!(bytes_saved = total_saved, "Font subsetting complete");
-    }
-
     Ok(total_saved)
 }
 
-/// Check if a font name indicates it was already subsetted.
-///
-/// Subsetted fonts have a prefix like `ABCDEF+` (6 uppercase letters + plus sign).
-fn is_already_subsetted(name: &str) -> bool {
-    if name.len() < 8 {
-        return false;
-    }
-    let bytes = name.as_bytes();
-    // Check first 6 chars are uppercase ASCII, 7th is '+'.
-    bytes[..6].iter().all(|b| b.is_ascii_uppercase()) && bytes[6] == b'+'
-}
-
-/// Find the font file stream ID from a FontDescriptor.
-fn find_font_file(doc: &Document, descriptor_id: ObjectId) -> Option<(&'static [u8], ObjectId)> {
-    let descriptor_dict = match doc.objects.get(&descriptor_id) {
-        Some(Object::Dictionary(d)) => d,
-        _ => return None,
-    };
-    for &key in FONT_FILE_KEYS {
-        if let Ok(Object::Reference(fid)) = descriptor_dict.get(key) {
-            return Some((key, *fid));
-        }
-    }
-    None
-}
-
-/// Check if a Type0 font's descendant CIDFont uses Identity CIDToGIDMap.
-fn has_identity_cid_to_gid_map(doc: &Document, font_id: ObjectId) -> bool {
-    let font_dict = match doc.objects.get(&font_id) {
-        Some(Object::Dictionary(d)) => d,
-        _ => return false,
-    };
-
-    let descendants = match font_dict.get(b"DescendantFonts") {
-        Ok(Object::Array(arr)) => arr,
-        Ok(Object::Reference(r)) => match doc.objects.get(r) {
-            Some(Object::Array(arr)) => arr,
-            _ => return false,
-        },
-        _ => return false,
-    };
-
-    for desc_ref in descendants {
-        let cid_font_id = match desc_ref {
-            Object::Reference(r) => *r,
-            _ => continue,
-        };
-        let cid_dict = match doc.objects.get(&cid_font_id) {
-            Some(Object::Dictionary(d)) => d,
-            _ => continue,
-        };
-        match cid_dict.get(b"CIDToGIDMap") {
-            Ok(Object::Name(n)) if n == b"Identity" => return true,
-            // A stream CIDToGIDMap is a full mapping table — we can't easily
-            // invert it, so treat as non-Identity and skip subsetting.
-            _ => return false,
-        }
-    }
-
-    false
-}
-
-// ── Content-stream-based character code collection ──────────────────────────
-
-/// Build a map of font ObjectId → set of character codes actually used across
-/// all page content streams.
-///
-/// Parses every page's content stream(s), tracking the current font set by
-/// `Tf` operators, and collecting character codes from `Tj`, `TJ`, `'`, and
-/// `"` text-showing operators.  Also recurses into Form XObjects referenced
-/// via `Do` operators.
-fn collect_used_chars_from_content_streams(doc: &Document) -> HashMap<ObjectId, HashSet<u16>> {
-    let mut font_chars: HashMap<ObjectId, HashSet<u16>> = HashMap::new();
-
-    let pages: Vec<ObjectId> = doc.page_iter().collect();
-
-    for page_id in pages {
-        // Build font resource name → (font_object_id, is_cid_font) for this page.
-        let font_map = build_page_font_map(doc, page_id);
-        if font_map.is_empty() {
-            continue;
-        }
-
-        // Get XObject dictionary for Form XObject recursion.
-        let xobject_map = build_page_xobject_map(doc, page_id);
-
-        // Decode all content streams for this page (handles decompression).
-        let content = match doc.get_and_decode_page_content(page_id) {
-            Ok(c) => c,
-            Err(e) => {
-                debug!(page_id = ?page_id, error = %e, "Failed to decode page content");
-                continue;
-            }
-        };
-
-        collect_chars_from_operations(
-            doc,
-            &content.operations,
-            &font_map,
-            &xobject_map,
-            &mut font_chars,
-            0,
-        );
-    }
-
-    font_chars
-}
-
-/// Build a map from font resource names (e.g. `b"F1"`) to `(font ObjectId, is_cid)`.
-fn build_page_font_map(doc: &Document, page_id: ObjectId) -> HashMap<Vec<u8>, (ObjectId, bool)> {
-    let mut map = HashMap::new();
-
-    // Use lopdf's get_page_resources which handles inherited resources.
-    let (resource_dict, resource_ids) = match doc.get_page_resources(page_id) {
-        Ok(r) => r,
-        Err(_) => return map,
-    };
-
-    let mut collect = |resources: &lopdf::Dictionary| {
-        let font_obj = match resources.get(b"Font") {
-            Ok(o) => o,
-            _ => return,
-        };
-        let font_dict = match font_obj {
-            Object::Dictionary(d) => d,
-            Object::Reference(r) => match doc.objects.get(r) {
-                Some(Object::Dictionary(d)) => d,
-                _ => return,
-            },
-            _ => return,
-        };
-
-        for (name, value) in font_dict.iter() {
-            let font_id = match value {
-                Object::Reference(r) => *r,
-                _ => continue,
-            };
-            if map.contains_key(name) {
-                continue;
-            }
-            let is_cid = is_cid_font(doc, font_id);
-            map.insert(name.clone(), (font_id, is_cid));
-        }
-    };
-
-    if let Some(resources) = resource_dict {
-        collect(resources);
-    }
-    for rid in resource_ids {
-        if let Ok(resources) = doc.get_dictionary(rid) {
-            collect(resources);
-        }
-    }
-
-    map
-}
-
-/// Build a map from XObject resource names to their ObjectIds.
-fn build_page_xobject_map(doc: &Document, page_id: ObjectId) -> HashMap<Vec<u8>, ObjectId> {
-    let mut map = HashMap::new();
-
-    let (resource_dict, resource_ids) = match doc.get_page_resources(page_id) {
-        Ok(r) => r,
-        Err(_) => return map,
-    };
-
-    let mut collect = |resources: &lopdf::Dictionary| {
-        let xobj = match resources.get(b"XObject") {
-            Ok(o) => o,
-            _ => return,
-        };
-        let xobj_dict = match xobj {
-            Object::Dictionary(d) => d,
-            Object::Reference(r) => match doc.objects.get(r) {
-                Some(Object::Dictionary(d)) => d,
-                _ => return,
-            },
-            _ => return,
-        };
-
-        for (name, value) in xobj_dict.iter() {
-            if let Object::Reference(r) = value {
-                map.entry(name.clone()).or_insert(*r);
-            }
-        }
-    };
-
-    if let Some(resources) = resource_dict {
-        collect(resources);
-    }
-    for rid in resource_ids {
-        if let Ok(resources) = doc.get_dictionary(rid) {
-            collect(resources);
-        }
-    }
-
-    map
-}
-
-/// Determine if a font ObjectId refers to a CIDFont (Type0 / composite font).
-fn is_cid_font(doc: &Document, font_id: ObjectId) -> bool {
-    match doc.objects.get(&font_id) {
-        Some(Object::Dictionary(d)) => {
-            matches!(d.get(b"Subtype"), Ok(Object::Name(n)) if n == b"Type0")
-        }
-        _ => false,
-    }
-}
-
-/// Walk content stream operations, tracking font state and collecting char codes.
-///
-/// `depth` limits Form XObject recursion to prevent cycles.
-fn collect_chars_from_operations(
-    doc: &Document,
-    operations: &[Operation],
-    font_map: &HashMap<Vec<u8>, (ObjectId, bool)>,
-    xobject_map: &HashMap<Vec<u8>, ObjectId>,
-    font_chars: &mut HashMap<ObjectId, HashSet<u16>>,
-    depth: u32,
-) {
-    let mut current_font: Option<(ObjectId, bool)> = None;
-
-    for op in operations {
-        match op.operator.as_str() {
-            "Tf" => {
-                // /FontName size Tf
-                if let Some(Object::Name(name)) = op.operands.first() {
-                    if let Some(&font_info) = font_map.get(name.as_slice()) {
-                        current_font = Some(font_info);
-                    }
-                }
-            }
-            "Tj" | "'" => {
-                // (string) Tj  or  (string) '
-                if let Some((font_id, is_cid)) = current_font {
-                    if let Some(Object::String(bytes, _)) = op.operands.first() {
-                        extract_char_codes(bytes, is_cid, font_chars.entry(font_id).or_default());
-                    }
-                }
-            }
-            "\"" => {
-                // aw ac (string) "
-                if let Some((font_id, is_cid)) = current_font {
-                    if let Some(Object::String(bytes, _)) = op.operands.get(2) {
-                        extract_char_codes(bytes, is_cid, font_chars.entry(font_id).or_default());
-                    }
-                }
-            }
-            "TJ" => {
-                // [(string) num (string) ...] TJ
-                if let Some((font_id, is_cid)) = current_font {
-                    if let Some(Object::Array(arr)) = op.operands.first() {
-                        let chars = font_chars.entry(font_id).or_default();
-                        for item in arr {
-                            if let Object::String(bytes, _) = item {
-                                extract_char_codes(bytes, is_cid, chars);
-                            }
-                        }
-                    }
-                }
-            }
-            "Do" => {
-                // Form XObject — may contain its own text operators.
-                if depth < 4 {
-                    if let Some(Object::Name(xobj_name)) = op.operands.first() {
-                        if let Some(&xobj_id) = xobject_map.get(xobj_name.as_slice()) {
-                            process_form_xobject_chars(
-                                doc,
-                                xobj_id,
-                                font_map,
-                                font_chars,
-                                depth + 1,
-                            );
-                        }
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-}
-
-/// Recurse into a Form XObject's content stream to collect character codes.
-fn process_form_xobject_chars(
-    doc: &Document,
-    xobj_id: ObjectId,
-    parent_font_map: &HashMap<Vec<u8>, (ObjectId, bool)>,
-    font_chars: &mut HashMap<ObjectId, HashSet<u16>>,
-    depth: u32,
-) {
-    let stream = match doc.objects.get(&xobj_id) {
-        Some(Object::Stream(s)) => s,
-        _ => return,
-    };
-
-    // Verify it's a Form XObject.
-    let is_form = matches!(
-        stream.dict.get(b"Subtype"),
-        Ok(Object::Name(n)) if n == b"Form"
-    );
-    if !is_form {
-        return;
-    }
-
-    // Build font map from the Form's own /Resources, falling back to parent.
-    let mut font_map = parent_font_map.clone();
-    if let Ok(Object::Dictionary(resources)) = stream.dict.get(b"Resources") {
-        if let Ok(font_obj) = resources.get(b"Font") {
-            let font_dict = match font_obj {
-                Object::Dictionary(d) => Some(d),
-                Object::Reference(r) => match doc.objects.get(r) {
-                    Some(Object::Dictionary(d)) => Some(d),
-                    _ => None,
-                },
-                _ => None,
-            };
-            if let Some(fd) = font_dict {
-                for (name, value) in fd.iter() {
-                    if let Object::Reference(r) = value {
-                        let is_cid = is_cid_font(doc, *r);
-                        font_map.insert(name.clone(), (*r, is_cid));
-                    }
-                }
-            }
-        }
-    }
-
-    // Build XObject map from Form's own resources.
-    let mut xobject_map: HashMap<Vec<u8>, ObjectId> = HashMap::new();
-    if let Ok(Object::Dictionary(resources)) = stream.dict.get(b"Resources") {
-        if let Ok(xobj) = resources.get(b"XObject") {
-            let xobj_dict = match xobj {
-                Object::Dictionary(d) => Some(d),
-                Object::Reference(r) => match doc.objects.get(r) {
-                    Some(Object::Dictionary(d)) => Some(d),
-                    _ => None,
-                },
-                _ => None,
-            };
-            if let Some(xd) = xobj_dict {
-                for (name, value) in xd.iter() {
-                    if let Object::Reference(r) = value {
-                        xobject_map.insert(name.clone(), *r);
-                    }
-                }
-            }
-        }
-    }
-
-    // Decode the Form XObject's content stream.
-    let content = match stream.decode_content() {
-        Ok(c) => c,
-        Err(e) => {
-            debug!(xobj_id = ?xobj_id, error = %e, "Failed to decode Form XObject content");
-            return;
-        }
-    };
-
-    collect_chars_from_operations(
-        doc,
-        &content.operations,
-        &font_map,
-        &xobject_map,
-        font_chars,
-        depth,
-    );
-}
-
-/// Extract character codes from a PDF string and insert them as glyph IDs.
-///
-/// For CIDFont (Type0): 2-byte big-endian encoding, each pair = one CID.
-/// For simple fonts: 1-byte encoding, each byte = one character code.
-fn extract_char_codes(bytes: &[u8], is_cid: bool, chars: &mut HashSet<u16>) {
-    if is_cid {
-        for chunk in bytes.chunks(2) {
-            if chunk.len() == 2 {
-                let cid = u16::from_be_bytes([chunk[0], chunk[1]]);
-                chars.insert(cid);
-            }
-        }
-    } else {
-        for &b in bytes {
-            chars.insert(b as u16);
-        }
-    }
-}
-
-// ── Tests ─────────────────────────────────────────────────────────────────────
-
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::path::Path;
 
-    #[test]
-    fn is_already_subsetted_detects_prefix() {
-        assert!(is_already_subsetted("ABCDEF+Arial"));
-        assert!(!is_already_subsetted("Arial"));
-        assert!(!is_already_subsetted("abc+Arial")); // lowercase
-        assert!(!is_already_subsetted("AB+Ar")); // too short prefix
+    use lopdf::dictionary;
+
+    use super::*;
+    use crate::domain::level::CompressionLevel;
+    use crate::test_support::PdfFixture;
+
+    const TEST_FONT_PATH: &str = "tests/fixtures/fonts/test-font.ttf";
+    const FAKE_PROGRAM: &[u8] = b"not-a-real-font-program";
+
+    fn options() -> PdfOptions {
+        PdfOptions::for_level(CompressionLevel::Medium)
+    }
+
+    fn type0_id(document: &Document) -> ObjectId {
+        document
+            .objects
+            .iter()
+            .find_map(|(id, object)| match object {
+                Object::Dictionary(dict) if dict_name_is(dict, b"Subtype", b"Type0") => Some(*id),
+                _ => None,
+            })
+            .expect("type0 font")
+    }
+
+    fn cid_document(program: &[u8], content: &[u8]) -> Document {
+        PdfFixture::new()
+            .page_with_content(content)
+            .with_identity_cid_font(program)
+            .build()
+    }
+
+    fn target_of(document: &Document) -> Option<FontTarget> {
+        eligible_target(document, type0_id(document), &HashSet::new())
     }
 
     #[test]
-    fn subset_fonts_empty_doc_returns_zero() {
-        let mut doc = Document::new();
-        let saved = subset_fonts(&mut doc).unwrap();
-        assert_eq!(saved, 0);
+    fn subset_tag_is_six_uppercase_letters_and_deterministic() {
+        let tag = subset_tag(&[0, 3, 9]);
+        assert_eq!(tag.len(), 6);
+        assert!(tag.chars().all(|letter| letter.is_ascii_uppercase()));
+        assert_eq!(tag, subset_tag(&[0, 3, 9]));
+        assert_ne!(tag, subset_tag(&[0, 3, 10]));
+    }
+
+    #[test]
+    fn is_subset_tagged_requires_six_uppercase_letters_and_plus() {
+        assert!(is_subset_tagged(b"ABCDEF+Arial"));
+        assert!(!is_subset_tagged(b"Arial"));
+        assert!(!is_subset_tagged(b"abcdef+Arial"));
+        assert!(!is_subset_tagged(b"ABCDE+Arial"));
+        assert!(!is_subset_tagged(b"ABCDEF"));
+    }
+
+    #[test]
+    fn build_cid_to_gid_map_maps_old_glyphs_to_new_glyphs() {
+        let glyphs = [0u16, 5, 9];
+        let remapper = GlyphRemapper::new_from_glyphs_sorted(&glyphs);
+        let map = build_cid_to_gid_map(&glyphs, &remapper);
+        assert_eq!(map.len(), 20);
+        assert_eq!(&map[10..12], &[0, 1]);
+        assert_eq!(&map[18..20], &[0, 2]);
+        assert_eq!(&map[2..4], &[0, 0]);
+    }
+
+    #[test]
+    fn font_eligibility_accepts_identity_cid_truetype_font() {
+        let document = cid_document(FAKE_PROGRAM, b"BT /F1 12 Tf <0024> Tj ET");
+        let target = target_of(&document).expect("eligible");
+        assert_eq!(target.type0_id, type0_id(&document));
+    }
+
+    #[test]
+    fn font_eligibility_rejects_simple_truetype() {
+        let mut document = cid_document(FAKE_PROGRAM, b"q Q");
+        let id = type0_id(&document);
+        document
+            .get_dictionary_mut(id)
+            .unwrap()
+            .set("Subtype", Object::Name(b"TrueType".to_vec()));
+        assert!(eligible_target(&document, id, &HashSet::new()).is_none());
+    }
+
+    #[test]
+    fn font_eligibility_rejects_non_identity_encoding() {
+        let mut document = cid_document(FAKE_PROGRAM, b"q Q");
+        let id = type0_id(&document);
+        document
+            .get_dictionary_mut(id)
+            .unwrap()
+            .set("Encoding", Object::Name(b"UniJIS-UCS2-H".to_vec()));
+        assert!(target_of(&document).is_none());
+    }
+
+    #[test]
+    fn font_eligibility_rejects_non_identity_cid_to_gid_map() {
+        let mut document = cid_document(FAKE_PROGRAM, b"q Q");
+        let target = target_of(&document).unwrap();
+        document
+            .get_dictionary_mut(target.descendant_id)
+            .unwrap()
+            .set("CIDToGIDMap", Object::Reference((999, 0)));
+        assert!(target_of(&document).is_none());
+    }
+
+    #[test]
+    fn font_eligibility_rejects_already_subset_tagged_font() {
+        let mut document = cid_document(FAKE_PROGRAM, b"q Q");
+        let id = type0_id(&document);
+        document
+            .get_dictionary_mut(id)
+            .unwrap()
+            .set("BaseFont", Object::Name(b"ABCDEF+Test".to_vec()));
+        assert!(target_of(&document).is_none());
+    }
+
+    #[test]
+    fn font_eligibility_rejects_cff_descendant() {
+        let mut document = cid_document(FAKE_PROGRAM, b"q Q");
+        let target = target_of(&document).unwrap();
+        document
+            .get_dictionary_mut(target.descendant_id)
+            .unwrap()
+            .set("Subtype", Object::Name(b"CIDFontType0".to_vec()));
+        assert!(target_of(&document).is_none());
+    }
+
+    #[test]
+    fn font_eligibility_rejects_font_in_acroform_default_resources() {
+        let mut document = cid_document(FAKE_PROGRAM, b"q Q");
+        let id = type0_id(&document);
+        let catalog = catalog_id(&document).unwrap();
+        document.get_dictionary_mut(catalog).unwrap().set(
+            "AcroForm",
+            Object::Dictionary(dictionary! {
+                "Fields" => Vec::<Object>::new(),
+                "DR" => dictionary! { "Font" => dictionary! { "F1" => id } },
+            }),
+        );
+        assert!(acroform_default_font_ids(&document).contains(&id));
+        assert!(find_targets(&document).is_empty());
+    }
+
+    #[test]
+    fn find_targets_skips_fonts_sharing_one_font_program() {
+        let mut document = cid_document(FAKE_PROGRAM, b"q Q");
+        let first = target_of(&document).unwrap();
+        let second_descendant =
+            document.add_object(document.get_object(first.descendant_id).unwrap().clone());
+        let second_type0 = document.add_object(Object::Dictionary({
+            let mut dict = document.get_dictionary(first.type0_id).unwrap().clone();
+            dict.set(
+                "DescendantFonts",
+                Object::Array(vec![Object::Reference(second_descendant)]),
+            );
+            dict
+        }));
+        assert!(eligible_target(&document, second_type0, &HashSet::new()).is_some());
+        assert!(find_targets(&document).is_empty());
+    }
+
+    #[test]
+    fn subset_fonts_skips_everything_when_usage_is_incomplete() {
+        let mut document = cid_document(FAKE_PROGRAM, b"BT /F1 12 Tf (unterminated Tj ET");
+        let before = document.objects.len();
+        assert_eq!(subset_fonts(&mut document, &options()).unwrap(), 0);
+        assert_eq!(document.objects.len(), before);
+    }
+
+    #[test]
+    fn subset_fonts_leaves_unused_font_untouched() {
+        let mut document = cid_document(FAKE_PROGRAM, b"q Q");
+        let before = document.objects.len();
+        assert_eq!(subset_fonts(&mut document, &options()).unwrap(), 0);
+        assert_eq!(document.objects.len(), before);
+    }
+
+    #[test]
+    fn subset_fonts_leaves_font_untouched_when_program_is_not_a_font() {
+        let mut document = cid_document(FAKE_PROGRAM, b"BT /F1 12 Tf <0024> Tj ET");
+        let target = target_of(&document).unwrap();
+        let before = document.get_object(target.font_file_id).unwrap().clone();
+        assert_eq!(subset_fonts(&mut document, &options()).unwrap(), 0);
+        assert_eq!(document.get_object(target.font_file_id).unwrap(), &before);
+    }
+
+    #[test]
+    fn subset_fonts_on_document_without_fonts_returns_zero() {
+        let mut document = PdfFixture::new().page_with_content(b"q Q").build();
+        assert_eq!(subset_fonts(&mut document, &options()).unwrap(), 0);
+    }
+
+    #[test]
+    #[ignore = "requires tests/fixtures/fonts/test-font.ttf"]
+    fn subset_fonts_shrinks_font_and_keeps_used_glyph_outlines() {
+        assert!(
+            Path::new(TEST_FONT_PATH).exists(),
+            "{TEST_FONT_PATH} is missing"
+        );
+        let program = std::fs::read(TEST_FONT_PATH).unwrap();
+        let mut document = cid_document(&program, b"BT /F1 12 Tf <002400250026> Tj ET");
+        let target = target_of(&document).unwrap();
+        let old_stored = match document.get_object(target.font_file_id).unwrap() {
+            Object::Stream(stream) => stream.content.len(),
+            _ => unreachable!(),
+        };
+        let saved = subset_fonts(&mut document, &options()).unwrap();
+        assert!(saved > 0, "saved {saved}");
+        let font_file = document
+            .get_object(target.font_file_id)
+            .unwrap()
+            .as_stream()
+            .unwrap();
+        assert!(font_file.content.len() < old_stored);
+        let inflated = decode_plain_stream(font_file, usize::MAX).unwrap();
+        assert_eq!(
+            font_file.dict.get(b"Length1").unwrap(),
+            &Object::Integer(inflated.len() as i64)
+        );
+        let descendant = document.get_dictionary(target.descendant_id).unwrap();
+        let map_id = descendant
+            .get(b"CIDToGIDMap")
+            .unwrap()
+            .as_reference()
+            .unwrap();
+        let map = decode_plain_stream(
+            document.get_object(map_id).unwrap().as_stream().unwrap(),
+            usize::MAX,
+        )
+        .unwrap();
+        let entries: Vec<u16> = [0x24usize, 0x25, 0x26]
+            .iter()
+            .map(|cid| u16::from_be_bytes([map[cid * 2], map[cid * 2 + 1]]))
+            .collect();
+        assert!(entries.iter().all(|gid| *gid != 0));
+        let distinct: BTreeSet<u16> = entries.iter().copied().collect();
+        assert_eq!(distinct.len(), 3);
+        let base_font = document
+            .get_dictionary(target.type0_id)
+            .unwrap()
+            .get(b"BaseFont")
+            .unwrap()
+            .as_name()
+            .unwrap();
+        assert!(is_subset_tagged(base_font));
     }
 }

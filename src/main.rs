@@ -6,6 +6,7 @@ use colored::Colorize;
 use media_compressor::app::batch::process_batch;
 use media_compressor::app::compress_file::compress_file;
 use media_compressor::app::info::read_pdf_info;
+use media_compressor::app::progress::{BatchProgress, NoProgress};
 use media_compressor::app::registry::CompressorRegistry;
 use media_compressor::app::{BatchRequest, CompressRequest};
 use media_compressor::cli::args::{BatchArgs, Cli, Commands, CompressArgs, InfoArgs};
@@ -47,14 +48,19 @@ fn run_compress(args: CompressArgs) -> AppResult<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-fn run_batch(args: BatchArgs) -> AppResult<ExitCode> {
+fn batch_progress(silent: bool) -> Box<dyn BatchProgress> {
+    if silent {
+        Box::new(NoProgress)
+    } else {
+        Box::new(IndicatifProgress::new())
+    }
+}
+
+fn run_batch(args: BatchArgs, quiet: bool) -> AppResult<ExitCode> {
     let json = args.json;
+    let progress = batch_progress(json || quiet);
     let request = BatchRequest::from(args);
-    let report = process_batch(
-        &request,
-        &CompressorRegistry::standard(),
-        &IndicatifProgress::new(),
-    )?;
+    let report = process_batch(&request, &CompressorRegistry::standard(), progress.as_ref())?;
     if json {
         println!("{}", to_pretty_json(&report)?);
     } else {
@@ -76,10 +82,10 @@ fn run_info(args: InfoArgs) -> AppResult<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-fn run(command: Commands) -> AppResult<ExitCode> {
-    match command {
+fn run(cli: Cli) -> AppResult<ExitCode> {
+    match cli.command {
         Commands::Compress(args) => run_compress(args),
-        Commands::Batch(args) => run_batch(args),
+        Commands::Batch(args) => run_batch(args, cli.quiet),
         Commands::Info(args) => run_info(args),
     }
 }
@@ -87,7 +93,7 @@ fn run(command: Commands) -> AppResult<ExitCode> {
 fn main() -> ExitCode {
     let cli = Cli::parse();
     init_logging(cli.verbose, cli.quiet);
-    match run(cli.command) {
+    match run(cli) {
         Ok(code) => code,
         Err(error) => {
             eprintln!("{} {}", "Error:".red().bold(), error);

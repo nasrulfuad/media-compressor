@@ -382,4 +382,74 @@ mod tests {
             AppError::ImageDecode(_) | AppError::ImageTooLarge { .. }
         ));
     }
+
+    #[derive(Clone, Default)]
+    struct CapturedLogs(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturedLogs {
+        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buffer);
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLogs {
+        type Writer = CapturedLogs;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    fn logs_while(action: impl FnOnce()) -> String {
+        let logs = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(logs.clone())
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::with_default(subscriber, action);
+        let bytes = logs.0.lock().unwrap().clone();
+        String::from_utf8(bytes).unwrap()
+    }
+
+    #[test]
+    fn keep_metadata_logs_warning() {
+        let mut settings = options();
+        settings.metadata = MetadataPolicy::Keep;
+        let input = png_input(16, 16);
+        let output = logs_while(|| {
+            compress_image_bytes(&input, ImageFormat::Png, &settings).unwrap();
+        });
+        assert!(
+            output.contains("Keeping metadata is not supported for images"),
+            "{output}"
+        );
+    }
+
+    #[test]
+    fn default_metadata_policy_logs_no_warning() {
+        let input = png_input(16, 16);
+        let output = logs_while(|| {
+            compress_image_bytes(&input, ImageFormat::Png, &options()).unwrap();
+        });
+        assert!(!output.contains("metadata"), "{output}");
+    }
+
+    #[test]
+    fn jpeg_output_from_transparent_png_logs_flattening_warning() {
+        let input = encode_as(&gradient_rgba_with_transparency(8, 8), CrateFormat::Png);
+        let mut settings = options();
+        settings.output_format = OutputFormat::Jpeg;
+        let output = logs_while(|| {
+            compress_image_bytes(&input, ImageFormat::Png, &settings).unwrap();
+        });
+        assert!(
+            output.contains("Flattening transparency onto white"),
+            "{output}"
+        );
+    }
 }
