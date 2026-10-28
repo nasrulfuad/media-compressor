@@ -57,6 +57,7 @@ mod tests {
 
     use super::*;
     use crate::app::media_compressor::{CompressedMedia, CompressionSettings};
+    use crate::app::test_settings;
     use crate::domain::media::ImageFormat;
     use crate::domain::report::MediaDetails;
 
@@ -166,6 +167,22 @@ mod tests {
             Box::new(FakeCompressor { label: "second" }),
         ]);
         assert_eq!(registry.find(&MediaType::Pdf).unwrap().name(), "first");
+    }
+
+    #[test]
+    fn registry_returns_the_registered_compressor_itself() {
+        let registry = CompressorRegistry::new(vec![Box::new(FakeCompressor { label: "fake" })]);
+        let compressor = registry.find(&MediaType::Pdf).unwrap();
+        let settings = test_settings();
+        assert_eq!(
+            compressor.output_extension(Path::new("in.pdf"), &MediaType::Pdf, &settings),
+            "fake"
+        );
+        let compressed = compressor
+            .compress(b"payload", &MediaType::Pdf, &settings)
+            .unwrap();
+        assert_eq!(compressed.bytes, b"payload");
+        assert!(compressed.kept_original);
     }
 
     #[test]

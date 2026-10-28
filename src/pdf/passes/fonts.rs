@@ -281,15 +281,15 @@ pub fn subset_fonts(document: &mut Document, options: &PdfOptions) -> AppResult<
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
-
     use lopdf::dictionary;
 
     use super::*;
     use crate::domain::level::CompressionLevel;
-    use crate::test_support::PdfFixture;
+    use crate::test_support::{
+        fixture_glyph_outline, glyph_count, glyph_outline, truetype_font, PdfFixture,
+    };
 
-    const TEST_FONT_PATH: &str = "tests/fixtures/fonts/test-font.ttf";
+    const LARGE_FONT_GLYPHS: u16 = 200;
     const FAKE_PROGRAM: &[u8] = b"not-a-real-font-program";
 
     fn options() -> PdfOptions {
@@ -474,58 +474,200 @@ mod tests {
         assert_eq!(subset_fonts(&mut document, &options()).unwrap(), 0);
     }
 
-    #[test]
-    #[ignore = "requires tests/fixtures/fonts/test-font.ttf"]
-    fn subset_fonts_shrinks_font_and_keeps_used_glyph_outlines() {
-        assert!(
-            Path::new(TEST_FONT_PATH).exists(),
-            "{TEST_FONT_PATH} is missing"
-        );
-        let program = std::fs::read(TEST_FONT_PATH).unwrap();
-        let mut document = cid_document(&program, b"BT /F1 12 Tf <002400250026> Tj ET");
-        let target = target_of(&document).unwrap();
-        let old_stored = match document.get_object(target.font_file_id).unwrap() {
-            Object::Stream(stream) => stream.content.len(),
-            _ => unreachable!(),
-        };
-        let saved = subset_fonts(&mut document, &options()).unwrap();
-        assert!(saved > 0, "saved {saved}");
+    fn stored_font_program(document: &Document, target: &FontTarget) -> Vec<u8> {
         let font_file = document
             .get_object(target.font_file_id)
             .unwrap()
             .as_stream()
             .unwrap();
-        assert!(font_file.content.len() < old_stored);
-        let inflated = decode_plain_stream(font_file, usize::MAX).unwrap();
-        assert_eq!(
-            font_file.dict.get(b"Length1").unwrap(),
-            &Object::Integer(inflated.len() as i64)
-        );
-        let descendant = document.get_dictionary(target.descendant_id).unwrap();
-        let map_id = descendant
+        decode_plain_stream(font_file, usize::MAX).unwrap()
+    }
+
+    fn stored_cid_map(document: &Document, target: &FontTarget) -> Vec<u8> {
+        let map_id = document
+            .get_dictionary(target.descendant_id)
+            .unwrap()
             .get(b"CIDToGIDMap")
             .unwrap()
             .as_reference()
             .unwrap();
-        let map = decode_plain_stream(
+        decode_plain_stream(
             document.get_object(map_id).unwrap().as_stream().unwrap(),
             usize::MAX,
         )
-        .unwrap();
-        let entries: Vec<u16> = [0x24usize, 0x25, 0x26]
-            .iter()
-            .map(|cid| u16::from_be_bytes([map[cid * 2], map[cid * 2 + 1]]))
-            .collect();
-        assert!(entries.iter().all(|gid| *gid != 0));
-        let distinct: BTreeSet<u16> = entries.iter().copied().collect();
-        assert_eq!(distinct.len(), 3);
-        let base_font = document
-            .get_dictionary(target.type0_id)
+        .unwrap()
+    }
+
+    fn mapped_glyph(cid_map: &[u8], cid: usize) -> u16 {
+        u16::from_be_bytes([cid_map[cid * 2], cid_map[cid * 2 + 1]])
+    }
+
+    fn name_of(document: &Document, id: ObjectId, key: &[u8]) -> Vec<u8> {
+        document
+            .get_dictionary(id)
             .unwrap()
-            .get(b"BaseFont")
+            .get(key)
             .unwrap()
             .as_name()
+            .unwrap()
+            .to_vec()
+    }
+
+    fn subsettable_document() -> Document {
+        cid_document(
+            &truetype_font(LARGE_FONT_GLYPHS),
+            b"BT /F1 12 Tf <002400250026> Tj ET",
+        )
+    }
+
+    #[test]
+    fn subset_fonts_shrinks_font_and_reports_saved_bytes() {
+        let mut document = subsettable_document();
+        let target = target_of(&document).unwrap();
+        let old_stored = document
+            .get_object(target.font_file_id)
+            .unwrap()
+            .as_stream()
+            .unwrap()
+            .content
+            .len();
+        let saved = subset_fonts(&mut document, &options()).unwrap();
+        let font_file = document
+            .get_object(target.font_file_id)
+            .unwrap()
+            .as_stream()
             .unwrap();
-        assert!(is_subset_tagged(base_font));
+        assert!(saved > 0, "saved {saved}");
+        assert!(font_file.content.len() < old_stored);
+        assert_eq!(glyph_count(&stored_font_program(&document, &target)), 4);
+    }
+
+    #[test]
+    fn subset_fonts_sets_length1_to_uncompressed_program_size() {
+        let mut document = subsettable_document();
+        let target = target_of(&document).unwrap();
+        subset_fonts(&mut document, &options()).unwrap();
+        let program = stored_font_program(&document, &target);
+        let font_file = document
+            .get_object(target.font_file_id)
+            .unwrap()
+            .as_stream()
+            .unwrap();
+        assert_eq!(
+            font_file.dict.get(b"Length1").unwrap(),
+            &Object::Integer(program.len() as i64)
+        );
+    }
+
+    #[test]
+    fn subset_fonts_keeps_used_glyph_outlines_behind_new_cid_to_gid_map() {
+        let mut document = subsettable_document();
+        let target = target_of(&document).unwrap();
+        subset_fonts(&mut document, &options()).unwrap();
+        let program = stored_font_program(&document, &target);
+        let cid_map = stored_cid_map(&document, &target);
+        let new_glyphs: BTreeSet<u16> = [0x24usize, 0x25, 0x26]
+            .iter()
+            .map(|cid| mapped_glyph(&cid_map, *cid))
+            .collect();
+        assert_eq!(new_glyphs, BTreeSet::from([1, 2, 3]));
+        for cid in [0x24u16, 0x25, 0x26] {
+            let new_glyph = mapped_glyph(&cid_map, usize::from(cid));
+            assert_eq!(
+                glyph_outline(&program, new_glyph),
+                fixture_glyph_outline(cid)
+            );
+        }
+        assert_eq!(mapped_glyph(&cid_map, 0x10), NOTDEF_GLYPH);
+    }
+
+    #[test]
+    fn subset_fonts_tags_type0_descendant_and_descriptor_names() {
+        let mut document = subsettable_document();
+        let target = target_of(&document).unwrap();
+        subset_fonts(&mut document, &options()).unwrap();
+        let type0_name = name_of(&document, target.type0_id, b"BaseFont");
+        assert!(is_subset_tagged(&type0_name));
+        assert!(type0_name.ends_with(b"+TestFont"));
+        assert_eq!(
+            name_of(&document, target.descendant_id, b"BaseFont"),
+            type0_name
+        );
+        assert_eq!(
+            name_of(&document, target.descriptor_id, b"FontName"),
+            type0_name
+        );
+    }
+
+    #[test]
+    fn subset_fonts_leaves_font_untouched_when_subset_is_not_smaller() {
+        let mut document = cid_document(&truetype_font(3), b"BT /F1 12 Tf <000100020000> Tj ET");
+        let target = target_of(&document).unwrap();
+        let before = document.get_object(target.font_file_id).unwrap().clone();
+        assert_eq!(subset_fonts(&mut document, &options()).unwrap(), 0);
+        assert_eq!(document.get_object(target.font_file_id).unwrap(), &before);
+        assert!(!is_subset_tagged(&name_of(
+            &document,
+            target.type0_id,
+            b"BaseFont"
+        )));
+    }
+
+    #[test]
+    fn subset_fonts_skips_font_whose_program_cannot_be_decoded() {
+        let mut document = subsettable_document();
+        let target = target_of(&document).unwrap();
+        if let Ok(Object::Stream(font_file)) = document.get_object_mut(target.font_file_id) {
+            font_file
+                .dict
+                .set("Filter", Object::Name(b"ASCII85Decode".to_vec()));
+        }
+        let before = document.get_object(target.font_file_id).unwrap().clone();
+        assert_eq!(subset_fonts(&mut document, &options()).unwrap(), 0);
+        assert_eq!(document.get_object(target.font_file_id).unwrap(), &before);
+    }
+
+    #[test]
+    fn plan_subset_returns_none_when_font_file_is_not_a_stream() {
+        let mut document = subsettable_document();
+        let target = target_of(&document).unwrap();
+        document
+            .objects
+            .insert(target.font_file_id, Object::Dictionary(Dictionary::new()));
+        let used = BTreeSet::from([0x24u16]);
+        assert!(plan_subset(&document, &target, &used, &options())
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn apply_tag_keeps_name_that_is_already_tagged() {
+        let mut document = subsettable_document();
+        let target = target_of(&document).unwrap();
+        document
+            .get_dictionary_mut(target.type0_id)
+            .unwrap()
+            .set("BaseFont", Object::Name(b"QWERTY+TestFont".to_vec()));
+        apply_tag(&mut document, target.type0_id, b"BaseFont", "ABCDEF");
+        assert_eq!(
+            name_of(&document, target.type0_id, b"BaseFont"),
+            b"QWERTY+TestFont"
+        );
+    }
+
+    #[test]
+    fn apply_tag_ignores_missing_name_and_missing_object() {
+        let mut document = subsettable_document();
+        let target = target_of(&document).unwrap();
+        apply_tag(&mut document, target.type0_id, b"Missing", "ABCDEF");
+        apply_tag(&mut document, (9999, 0), b"BaseFont", "ABCDEF");
+        assert!(!document
+            .get_dictionary(target.type0_id)
+            .unwrap()
+            .has(b"Missing"));
+        assert_eq!(
+            name_of(&document, target.type0_id, b"BaseFont"),
+            b"TestFont"
+        );
     }
 }

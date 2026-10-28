@@ -62,15 +62,16 @@ fn compress_with_mozjpeg(pixels: &RawPixels, settings: JpegSettings) -> AppResul
         .map_err(|error| AppError::Encode(format!("mozjpeg finish: {error}")))
 }
 
+fn compress_isolating_panics(pixels: &RawPixels, settings: JpegSettings) -> AppResult<Vec<u8>> {
+    catch_unwind(AssertUnwindSafe(|| compress_with_mozjpeg(pixels, settings)))
+        .map_err(|_| AppError::Encode("mozjpeg panicked".to_string()))?
+}
+
 pub fn encode_jpeg(image: &DynamicImage, settings: JpegSettings) -> AppResult<Vec<u8>> {
     if image.width() == 0 || image.height() == 0 {
         return Err(AppError::Encode("cannot encode an empty image".to_string()));
     }
-    let pixels = raw_pixels(image, settings.color_mode);
-    catch_unwind(AssertUnwindSafe(|| {
-        compress_with_mozjpeg(&pixels, settings)
-    }))
-    .map_err(|_| AppError::Encode("mozjpeg panicked".to_string()))?
+    compress_isolating_panics(&raw_pixels(image, settings.color_mode), settings)
 }
 
 #[cfg(test)]
@@ -141,5 +142,24 @@ mod tests {
         let error =
             encode_jpeg(&image, settings(ColorMode::Preserve, ScanMode::Baseline)).unwrap_err();
         assert!(matches!(error, AppError::Encode(_)));
+    }
+
+    #[test]
+    fn compress_isolating_panics_turns_mozjpeg_panic_into_encode_error() {
+        let truncated = RawPixels {
+            color_space: mozjpeg::ColorSpace::JCS_RGB,
+            width: 4,
+            height: 4,
+            samples: vec![0; 4 * 3 * 2],
+        };
+        let error = compress_isolating_panics(
+            &truncated,
+            settings(ColorMode::Preserve, ScanMode::Baseline),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&error, AppError::Encode(message) if message == "mozjpeg panicked"),
+            "{error}"
+        );
     }
 }
