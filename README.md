@@ -8,15 +8,15 @@ Fast media compressor written in Rust. Compresses PDF and image files by recompr
 - **4 compression levels** — low, medium, high, extreme with tunable presets
 - **Image re-encoding** — mozjpeg (progressive JPEG) and oxipng for embedded images
 - **DPI downsampling** — page-aware DPI calculation with configurable targets
-- **Complexity-aware quality** — adjusts JPEG quality based on image content (flat vs photographic)
+- **Smallest encoding wins** — each image is tried as JPEG, PNG-predictor Flate and plain Flate; the smallest result is kept, and only if it beats the original
 - **Stream optimization** — zlib recompression, LZW-to-Flate conversion, content stream merging, whitespace compaction
-- **Object cleanup** — remove thumbnails, JavaScript, non-link annotations, output intents, piece info, named destinations
-- **Stream deduplication** — find byte-identical streams and rewrite references
+- **Object cleanup** — thumbnails, JavaScript and piece info at every level; markup annotations at high/extreme; output intents at extreme. Link annotations and named destinations are always kept
+- **Stream deduplication** — merge streams whose dictionary and bytes are identical and rewrite references
 - **Font optimization** — glyph subsetting for identity CID TrueType fonts, driven by a full content stream scan with `/CIDToGIDMap` rebuilt (opt-in)
 - **Inline image conversion** — convert BI/ID/EI inline images to XObject references
 - **Metadata stripping** — remove /Info dictionary and XMP metadata streams
 - **Structure tree removal** — strip /StructTreeRoot, /MarkInfo at high/extreme levels
-- **AcroForm removal** — strip interactive form fields at extreme level
+- **AcroForm removal** — strip interactive form fields and widgets at extreme level, unless the form contains a signature field
 - **Embedded file removal** — strip attached files at high/extreme levels
 - **Atomic writes** — write to temp file, then rename; clean up on failure
 
@@ -123,14 +123,14 @@ media-compressor info document.pdf --json
 
 ## Compression Levels
 
-| Level | Image Quality | DPI Target | Strip Metadata | Grayscale | Remove Struct Tree | Remove AcroForm | Remove Embedded Files |
+| Level | Image Quality | DPI Target | PNG Effort | Strip Metadata | Grayscale | Remove Markup Annots / Struct Tree / Embedded Files | Remove AcroForm / Output Intents |
 |-------|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
-| `low` | 90% | none | no | no | no | no | no |
-| `medium` (default) | 75% | 200 | no | no | no | no | no |
-| `high` | 60% | 150 | yes | no | yes | no | yes |
-| `extreme` | 40% | 96 | yes | yes | yes | yes | yes |
+| `low` | 90% | none | 2 | no | no | no | no |
+| `medium` (default) | 75% | 200 | 4 | no | no | no | no |
+| `high` | 60% | 150 | 5 | yes | no | yes | no |
+| `extreme` | 40% | 96 | 6 | yes | yes | yes | yes |
 
-All levels perform: stream recompression, object deduplication, thumbnail/JS/annotation removal, inline image conversion, content stream optimization.
+All levels perform: stream recompression, object deduplication, thumbnail/JavaScript/piece info removal, inline image conversion, content stream optimization. Link annotations and named destinations are never removed. AcroForm is kept at every level when it contains a signature field.
 
 ## CLI Reference
 
@@ -155,8 +155,8 @@ Global options:
 | `-o, --output <PATH>` | Output file path (default: `<input>_compressed.<ext>`) |
 | `-l, --level <LEVEL>` | Compression level: `low`, `medium`, `high`, `extreme` |
 | `--keep-metadata` | Preserve document metadata regardless of level |
-| `--image-quality <1-100>` | Override JPEG quality for PDF embedded images |
-| `--quality <1-100>` | Override encoding quality (images and PDF; takes precedence over `--image-quality`) |
+| `--image-quality <1-100>` | Override JPEG quality for PDF embedded images (takes precedence over `--quality` for PDFs) |
+| `--quality <1-100>` | Override encoding quality for image files and PDF embedded images |
 | `--dpi <NUM>` | Override target DPI for image downsampling |
 | `-f, --format <FMT>` | Output format for images: `original`, `jpeg`, `png` |
 | `--max-dimension <PX>` | Resize so no dimension exceeds PX (aspect ratio preserved) |
@@ -180,7 +180,7 @@ Global options:
 | `-w, --workers <NUM>` | Parallel workers (0 = auto-detect CPU count) |
 | `--continue-on-error` | Keep going after a failure (default: stop and skip the remaining files) |
 | `--keep-metadata` | Preserve document metadata |
-| `--image-quality <1-100>` | Override JPEG quality of PDF images |
+| `--image-quality <1-100>` | Override JPEG quality of PDF images (takes precedence over `--quality` for PDFs) |
 | `--quality <1-100>` | Override encoding quality (PDF images and image files) |
 | `-f, --format <FMT>` | Output format for images: `original`, `jpeg`, `png` |
 | `--max-dimension <PX>` | Resize images so no side exceeds PX |
@@ -214,6 +214,164 @@ Global options:
 
 ## Architecture
 
+### Layers
+
+The crate follows a layered clean architecture: dependencies point inward only, and inner layers never import outer ones. `error` is a shared leaf used by every layer.
+
+```mermaid
+flowchart TD
+    subgraph Entry["Entry point"]
+        main["main.rs<br/>composition root, logging, exit codes"]
+    end
+
+    subgraph Interface["Interface adapters"]
+        cli["cli<br/>clap args, request mapping,<br/>indicatif progress"]
+        presentation["presentation<br/>pretty and JSON rendering"]
+    end
+
+    subgraph Application["Application"]
+        app["app<br/>compress_file, batch, info,<br/>CompressorRegistry, MediaCompressor"]
+    end
+
+    subgraph Engines["Engines and infrastructure"]
+        pdf["pdf<br/>engine, pipeline, passes"]
+        raster["raster<br/>image engine, transforms"]
+        fs["fs<br/>bounded read, atomic write,<br/>discovery"]
+        detection["detection<br/>magic bytes"]
+    end
+
+    subgraph Codecs["Codecs"]
+        codec["codec<br/>zlib, LZW, mozjpeg, oxipng"]
+    end
+
+    subgraph Core["Domain"]
+        domain["domain<br/>media types, levels,<br/>options, reports"]
+    end
+
+    error["error<br/>AppError, AppResult"]
+
+    main --> cli
+    main --> app
+    main --> presentation
+    cli --> app
+    cli --> domain
+    presentation --> domain
+    app --> pdf
+    app --> raster
+    app --> fs
+    app --> detection
+    app --> domain
+    pdf --> codec
+    pdf --> domain
+    raster --> codec
+    raster --> domain
+    detection --> domain
+    codec --> domain
+
+    main -.-> error
+    app -.-> error
+    pdf -.-> error
+    raster -.-> error
+    fs -.-> error
+    codec -.-> error
+    presentation -.-> error
+```
+
+| Layer | Modules | Rules |
+|---|---|---|
+| Entry point | `main.rs` | Composition root: builds the registry, picks the progress reporter, renders the report, maps errors to exit codes |
+| Interface adapters | `cli`, `presentation` | Only `cli` imports `clap`; only these layers use `colored` / `indicatif` |
+| Application | `app` | Orchestrates use cases; never branches on media type |
+| Engines and infrastructure | `pdf`, `raster`, `fs`, `detection` | Engines work on in-memory data; only `fs` touches the file system |
+| Codecs | `codec` | Single source of truth for zlib, LZW, JPEG and PNG encoding |
+| Domain | `domain` | Plain types, no I/O, no external frameworks |
+
+### Extension Points
+
+Three traits decouple the layers, each with real implementations:
+
+```mermaid
+classDiagram
+    class MediaCompressor {
+        <<trait>>
+        name() str
+        supports(media_type) bool
+        output_extension(input_path, media_type, settings) String
+        compress(input, media_type, settings) CompressedMedia
+    }
+    class CompressorRegistry {
+        standard() CompressorRegistry
+        find(media_type) MediaCompressor
+    }
+    class PdfCompressor
+    class ImageCompressor
+    MediaCompressor <|.. PdfCompressor
+    MediaCompressor <|.. ImageCompressor
+    CompressorRegistry o-- MediaCompressor
+
+    class BatchProgress {
+        <<trait>>
+        start(total_files)
+        file_finished()
+        finish()
+    }
+    class NoProgress
+    class IndicatifProgress
+    BatchProgress <|.. NoProgress
+    BatchProgress <|.. IndicatifProgress
+
+    class PdfPass {
+        <<trait>>
+        name() str
+        is_enabled(options) bool
+        run(document, options) saved_bytes
+    }
+    class CleanupPass
+    class InlineImagesPass
+    class DedupPass
+    class StreamsPass
+    class ImagesPass
+    class MergeContentPass
+    class FontsPass
+    class MetadataPass
+    PdfPass <|.. CleanupPass
+    PdfPass <|.. InlineImagesPass
+    PdfPass <|.. DedupPass
+    PdfPass <|.. StreamsPass
+    PdfPass <|.. ImagesPass
+    PdfPass <|.. MergeContentPass
+    PdfPass <|.. FontsPass
+    PdfPass <|.. MetadataPass
+```
+
+### Single-File Flow
+
+```mermaid
+sequenceDiagram
+    participant CLI as main / cli
+    participant App as app::compress_file
+    participant FS as fs
+    participant Det as detection
+    participant Reg as CompressorRegistry
+    participant Comp as MediaCompressor
+    participant Pres as presentation
+
+    CLI->>App: compress_file(CompressRequest, CompressorRegistry::standard())
+    App->>FS: read_bounded(input)
+    FS-->>App: bytes
+    App->>Det: detect_media_type(bytes)
+    Det-->>App: MediaType
+    App->>Reg: find(MediaType)
+    Reg-->>App: compressor
+    App->>Comp: compress(bytes, MediaType, settings)
+    Comp-->>App: CompressedMedia
+    alt not dry run
+        App->>FS: write_atomically(output)
+    end
+    App-->>CLI: FileReport
+    CLI->>Pres: render pretty / JSON
+```
+
 ### PDF Compression Pipeline
 
 The pipeline is a list of passes run in strict order on an in-memory document (`src/pdf/pipeline.rs`):
@@ -223,7 +381,7 @@ The pipeline is a list of passes run in strict order on an in-memory document (`
 3. **Inline images** — convert `BI`/`ID`/`EI` to XObjects with the in-house content lexer, so they are compressed by later passes
 4. **Stream dedup** — merge streams whose dictionary and bytes are identical
 5. **Stream compression** — minify content streams with a tokenizer and re-deflate plain Flate/LZW streams; filter chains and predictors are left alone
-6. **Image compression** — DPI downsampling, complexity-aware quality; smallest of JPEG, PNG-predictor Flate and plain Flate wins
+6. **Image compression** — DPI downsampling; smallest of JPEG, PNG-predictor Flate and plain Flate wins, and only replaces the image when smaller
 7. **Content stream merging** — merge multi-stream pages
 8. **Font subsetting** (opt-in) — identity CID TrueType fonts only
 9. **Metadata stripping** — remove `/Info`, XMP and `/Metadata` references (level-dependent)
@@ -277,12 +435,23 @@ Adding a media type means one new `MediaCompressor` implementation plus one line
 ## Development
 
 ```bash
-cargo build              # Build dev binary
-cargo test               # Run all tests
-cargo clippy -- -D warnings  # Lint (zero warnings policy)
-cargo fmt                # Format code
-make check               # test + clippy + fmt + no-comments
+make build               # Debug build
+make build-release       # Optimized release build (LTO, strip)
+make test                # cargo test --all-features
+make lint                # clippy -D warnings (zero warnings policy)
+make fmt                 # Format code
+make check               # test + lint + fmt-check + no-comments (run before committing)
 make coverage            # 90% line coverage gate (needs cargo-llvm-cov)
+make bench               # criterion benchmarks
+```
+
+Shortcuts for running the release binary:
+
+```bash
+make run FILE=input.pdf LEVEL=high OUTPUT=out.pdf
+make batch DIR=./pdfs LEVEL=high
+make dry-run FILE=input.pdf
+make info FILE=input.pdf JSON=1
 ```
 
 ### Benchmarks
