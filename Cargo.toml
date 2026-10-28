@@ -6,7 +6,7 @@ authors = ["Nasrul <nasrulfuad08@gmail.com>"]
 description = "Fast media compressor (PDF, images) written in Rust"
 license = "MIT"
 readme = "README.md"
-repository = "https://github.com/nasrulfuad/media-compressor"
+repository = "https://github.com/nasrulfuad/media_compressor"
 keywords = ["pdf", "image", "compression", "cli"]
 categories = ["command-line-utilities"]
 
